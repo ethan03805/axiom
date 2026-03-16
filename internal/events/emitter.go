@@ -32,6 +32,7 @@ const (
 	EventScopeExpansionDenied    EventType = "scope_expansion_denied"
 	EventContextInvalidation     EventType = "context_invalidation_warning"
 	EventProviderUnavailable     EventType = "provider_unavailable"
+	EventCrashRecovery           EventType = "crash_recovery"
 )
 
 // Event represents a system event that can be emitted and subscribed to.

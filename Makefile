@@ -1,4 +1,4 @@
-.PHONY: build test lint docker-images clean
+.PHONY: build test lint docker-images gui all clean
 
 BINARY_NAME=axiom
 BUILD_DIR=bin
@@ -15,8 +15,15 @@ lint:
 	golangci-lint run ./...
 
 docker-images:
-	docker build -t axiom-worker:latest -f Dockerfile.worker .
-	docker build -t axiom-validator:latest -f Dockerfile.validator .
+	docker build -t axiom-meeseeks-go:latest -f docker/Dockerfile.meeseeks-go .
+	docker build -t axiom-meeseeks-node:latest -f docker/Dockerfile.meeseeks-node .
+	docker build -t axiom-meeseeks-python:latest -f docker/Dockerfile.meeseeks-python .
+	docker build -t axiom-meeseeks-multi:latest -f docker/Dockerfile.meeseeks-multi .
+
+gui:
+	cd gui/frontend && npm install && npm run build
+
+all: build docker-images gui
 
 clean:
 	rm -rf $(BUILD_DIR)

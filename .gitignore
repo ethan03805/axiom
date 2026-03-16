@@ -30,3 +30,8 @@ coverage.html
 # OS files
 .DS_Store
 Thumbs.db
+
+# Project documentation (not for GitHub)
+Architecture.md
+BUILD_PLAN.md
+CLAUDE.md

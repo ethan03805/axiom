@@ -48,42 +48,44 @@ type OrchestratorConfig struct {
 
 // BitNetConfig controls the local BitNet model server.
 type BitNetConfig struct {
-	Enabled              bool   `toml:"enabled"`
-	Host                 string `toml:"host"`
-	Port                 int    `toml:"port"`
-	MaxConcurrentRequests int   `toml:"max_concurrent_requests"`
-	CPUThreads           int    `toml:"cpu_threads"`
+	Enabled               bool   `toml:"enabled"`
+	Host                  string `toml:"host"`
+	Port                  int    `toml:"port"`
+	MaxConcurrentRequests int    `toml:"max_concurrent_requests"`
+	CPUThreads            int    `toml:"cpu_threads"`
 }
 
 // DockerConfig holds container runtime settings.
+// CPULimit is a float representing CPU cores (e.g. 0.5 = half a core).
 type DockerConfig struct {
-	Image          string `toml:"image"`
-	TimeoutMinutes int    `toml:"timeout_minutes"`
-	CPULimit       string `toml:"cpu_limit"`
-	MemLimit       string `toml:"mem_limit"`
-	NetworkMode    string `toml:"network_mode"`
+	Image          string  `toml:"image"`
+	TimeoutMinutes int     `toml:"timeout_minutes"`
+	CPULimit       float64 `toml:"cpu_limit"`
+	MemLimit       string  `toml:"mem_limit"`
+	NetworkMode    string  `toml:"network_mode"`
 }
 
 // ValidationConfig holds validation and testing settings.
+// CPULimit is a float representing CPU cores (e.g. 1.0 = one core).
 type ValidationConfig struct {
-	TimeoutMinutes       int                        `toml:"timeout_minutes"`
-	CPULimit             string                     `toml:"cpu_limit"`
-	MemLimit             string                     `toml:"mem_limit"`
-	Network              string                     `toml:"network"`
-	AllowDependencyInstall bool                     `toml:"allow_dependency_install"`
-	SecurityScan         bool                       `toml:"security_scan"`
-	WarmPoolEnabled      bool                       `toml:"warm_pool_enabled"`
-	WarmPoolSize         int                        `toml:"warm_pool_size"`
-	WarmColdInterval     int                        `toml:"warm_cold_interval"`
-	Integration          ValidationIntegrationConfig `toml:"integration"`
+	TimeoutMinutes         int                        `toml:"timeout_minutes"`
+	CPULimit               float64                    `toml:"cpu_limit"`
+	MemLimit               string                     `toml:"mem_limit"`
+	Network                string                     `toml:"network"`
+	AllowDependencyInstall bool                       `toml:"allow_dependency_install"`
+	SecurityScan           bool                       `toml:"security_scan"`
+	WarmPoolEnabled        bool                       `toml:"warm_pool_enabled"`
+	WarmPoolSize           int                        `toml:"warm_pool_size"`
+	WarmColdInterval       int                        `toml:"warm_cold_interval"`
+	Integration            ValidationIntegrationConfig `toml:"integration"`
 }
 
 // ValidationIntegrationConfig holds integration test settings.
 type ValidationIntegrationConfig struct {
-	Enabled         bool              `toml:"enabled"`
-	AllowedServices []string          `toml:"allowed_services"`
-	Secrets         map[string]string `toml:"secrets"`
-	NetworkEgress   bool              `toml:"network_egress"`
+	Enabled         bool     `toml:"enabled"`
+	AllowedServices []string `toml:"allowed_services"`
+	Secrets         []string `toml:"secrets"`
+	NetworkEgress   []string `toml:"network_egress"`
 }
 
 // SecurityConfig holds security-related settings.
@@ -111,7 +113,8 @@ type ObservabilityConfig struct {
 	LogTokenCounts bool `toml:"log_token_counts"`
 }
 
-// DefaultConfig returns a Config with sensible default values.
+// DefaultConfig returns a Config with sensible default values matching
+// Architecture.md Appendix A.
 func DefaultConfig() *Config {
 	return &Config{
 		Budget: BudgetConfig{
@@ -119,39 +122,51 @@ func DefaultConfig() *Config {
 			WarnAtPercent: 80.0,
 		},
 		Concurrency: ConcurrencyConfig{
-			MaxMeeseeks: 3,
+			MaxMeeseeks: 10,
 		},
 		Orchestrator: OrchestratorConfig{
-			Runtime: "docker",
+			Runtime:             "claw",
+			SRSApprovalDelegate: "user",
 		},
 		BitNet: BitNetConfig{
-			Host: "localhost",
-			Port: 8080,
+			Enabled:               true,
+			Host:                  "localhost",
+			Port:                  3002,
+			MaxConcurrentRequests: 4,
+			CPUThreads:            4,
 		},
 		Docker: DockerConfig{
-			Image:          "axiom-worker:latest",
+			Image:          "axiom-meeseeks-multi:latest",
 			TimeoutMinutes: 30,
-			CPULimit:       "2",
-			MemLimit:       "4g",
+			CPULimit:       0.5,
+			MemLimit:       "2g",
 			NetworkMode:    "none",
 		},
 		Validation: ValidationConfig{
-			TimeoutMinutes: 10,
-			CPULimit:       "1",
-			MemLimit:       "2g",
-			Network:        "none",
-			SecurityScan:   true,
-			WarmPoolSize:   2,
+			TimeoutMinutes:         10,
+			CPULimit:               1.0,
+			MemLimit:               "4g",
+			Network:                "none",
+			AllowDependencyInstall: true,
+			SecurityScan:           false,
+			WarmPoolEnabled:        false,
+			WarmPoolSize:           3,
+			WarmColdInterval:       10,
+		},
+		Security: SecurityConfig{
+			ForceLocalForSensitive: true,
+			SensitivePatterns:      []string{"*.env*", "*credentials*", "**/secrets/**"},
 		},
 		Git: GitConfig{
 			AutoCommit:   true,
-			BranchPrefix: "axiom/",
+			BranchPrefix: "axiom",
 		},
 		API: APIConfig{
-			Port:         7700,
-			RateLimitRPM: 60,
+			Port:         3000,
+			RateLimitRPM: 120,
 		},
 		Observability: ObservabilityConfig{
+			LogPrompts:     false,
 			LogTokenCounts: true,
 		},
 	}

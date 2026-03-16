@@ -125,9 +125,9 @@ func (e *Engine) CrashRecovery() error {
 
 	if resetCount > 0 || lockCount > 0 {
 		e.emitter.Emit(events.Event{
-			Type: events.EventTaskCreated,
+			Type:      events.EventCrashRecovery,
+			AgentType: "engine",
 			Details: map[string]interface{}{
-				"action":      "crash_recovery",
 				"tasks_reset": resetCount,
 				"locks_freed": lockCount,
 			},
