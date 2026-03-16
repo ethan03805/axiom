@@ -1,15 +1,24 @@
 package state
 
 import (
+	"database/sql"
 	"fmt"
 )
 
 // InsertCost persists a cost log entry to the database.
+// AttemptID of 0 is treated as NULL (no associated attempt).
 func (db *DB) InsertCost(entry *CostEntry) error {
+	var attemptID interface{}
+	if entry.AttemptID != 0 {
+		attemptID = entry.AttemptID
+	} else {
+		attemptID = sql.NullInt64{}
+	}
+
 	result, err := db.conn.Exec(
 		`INSERT INTO cost_log (task_id, attempt_id, agent_type, model_id, input_tokens, output_tokens, cost_usd, timestamp)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		nullString(entry.TaskID), entry.AttemptID, entry.AgentType,
+		nullString(entry.TaskID), attemptID, entry.AgentType,
 		entry.ModelID, entry.InputTokens, entry.OutputTokens,
 		entry.CostUSD, entry.Timestamp,
 	)
