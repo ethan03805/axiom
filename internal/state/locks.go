@@ -1,0 +1,121 @@
+package state
+
+import (
+	"fmt"
+	"sort"
+	"time"
+)
+
+// LockRequest describes a resource to be locked.
+type LockRequest struct {
+	ResourceType string
+	ResourceKey  string
+}
+
+// Lock represents an active resource lock.
+type Lock struct {
+	ResourceType string
+	ResourceKey  string
+	TaskID       string
+	LockedAt     time.Time
+}
+
+// AcquireLocks acquires all requested locks atomically (all-or-nothing).
+// Locks are acquired in sorted order by (resource_type, resource_key)
+// to prevent deadlocks.
+func (db *DB) AcquireLocks(taskID string, locks []LockRequest) error {
+	if len(locks) == 0 {
+		return nil
+	}
+
+	// Sort locks deterministically to prevent deadlocks
+	sorted := make([]LockRequest, len(locks))
+	copy(sorted, locks)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].ResourceType == sorted[j].ResourceType {
+			return sorted[i].ResourceKey < sorted[j].ResourceKey
+		}
+		return sorted[i].ResourceType < sorted[j].ResourceType
+	})
+
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Check that none of the resources are already locked
+	for _, lock := range sorted {
+		var count int
+		err := tx.QueryRow(
+			"SELECT COUNT(*) FROM task_locks WHERE resource_type = ? AND resource_key = ?",
+			lock.ResourceType, lock.ResourceKey,
+		).Scan(&count)
+		if err != nil {
+			return fmt.Errorf("check lock: %w", err)
+		}
+		if count > 0 {
+			return fmt.Errorf("resource already locked: %s/%s", lock.ResourceType, lock.ResourceKey)
+		}
+	}
+
+	// All clear, acquire all locks
+	for _, lock := range sorted {
+		_, err := tx.Exec(
+			"INSERT INTO task_locks (resource_type, resource_key, task_id) VALUES (?, ?, ?)",
+			lock.ResourceType, lock.ResourceKey, taskID,
+		)
+		if err != nil {
+			return fmt.Errorf("insert lock: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// ReleaseLocks releases all locks held by the given task.
+func (db *DB) ReleaseLocks(taskID string) error {
+	_, err := db.conn.Exec("DELETE FROM task_locks WHERE task_id = ?", taskID)
+	if err != nil {
+		return fmt.Errorf("release locks: %w", err)
+	}
+	return nil
+}
+
+// GetLockedResources returns all active locks.
+func (db *DB) GetLockedResources() ([]Lock, error) {
+	rows, err := db.conn.Query(
+		"SELECT resource_type, resource_key, task_id, locked_at FROM task_locks ORDER BY resource_type, resource_key",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get locks: %w", err)
+	}
+	defer rows.Close()
+
+	var locks []Lock
+	for rows.Next() {
+		var l Lock
+		if err := rows.Scan(&l.ResourceType, &l.ResourceKey, &l.TaskID, &l.LockedAt); err != nil {
+			return nil, fmt.Errorf("scan lock: %w", err)
+		}
+		locks = append(locks, l)
+	}
+	return locks, rows.Err()
+}
+
+// IsLocked checks if a resource is currently locked.
+// Returns whether it's locked and the holding task ID.
+func (db *DB) IsLocked(resourceType, resourceKey string) (bool, string, error) {
+	var taskID string
+	err := db.conn.QueryRow(
+		"SELECT task_id FROM task_locks WHERE resource_type = ? AND resource_key = ?",
+		resourceType, resourceKey,
+	).Scan(&taskID)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			return false, "", nil
+		}
+		return false, "", fmt.Errorf("check lock: %w", err)
+	}
+	return true, taskID, nil
+}

@@ -1,16 +1,8 @@
 package state
 
 import (
-	"database/sql"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
-
-// Store provides durable state management backed by SQLite.
-type Store struct {
-	db *sql.DB
-}
 
 // Task represents a unit of work in the system.
 type Task struct {
@@ -118,79 +110,4 @@ type EcoEntry struct {
 	ApprovedBy     string
 	CreatedAt      time.Time
 	ResolvedAt     *time.Time
-}
-
-// New creates a new Store connected to the given SQLite database path.
-func New(dbPath string) (*Store, error) {
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return nil, err
-	}
-	return &Store{db: db}, nil
-}
-
-// Close closes the underlying database connection.
-func (s *Store) Close() error {
-	return s.db.Close()
-}
-
-// Migrate applies the schema migrations to the database.
-func (s *Store) Migrate(schema string) error {
-	_, err := s.db.Exec(schema)
-	return err
-}
-
-// CreateTask inserts a new task into the database.
-func (s *Store) CreateTask(task *Task) error {
-	return nil
-}
-
-// GetTask retrieves a task by ID.
-func (s *Store) GetTask(id string) (*Task, error) {
-	return nil, nil
-}
-
-// UpdateTaskStatus updates the status of a task.
-func (s *Store) UpdateTaskStatus(id, status string) error {
-	return nil
-}
-
-// ListTasks returns tasks matching the given status filter.
-func (s *Store) ListTasks(status string) ([]*Task, error) {
-	return nil, nil
-}
-
-// CreateAttempt inserts a new task attempt.
-func (s *Store) CreateAttempt(attempt *TaskAttempt) error {
-	return nil
-}
-
-// RecordValidation inserts a validation run result.
-func (s *Store) RecordValidation(run *ValidationRun) error {
-	return nil
-}
-
-// RecordReview inserts a review run result.
-func (s *Store) RecordReview(run *ReviewRun) error {
-	return nil
-}
-
-// RecordArtifact inserts a task artifact record.
-func (s *Store) RecordArtifact(artifact *TaskArtifact) error {
-	return nil
-}
-
-// RecordCost inserts a cost log entry.
-func (s *Store) RecordCost(entry *CostEntry) error {
-	return nil
-}
-
-// AcquireLock attempts to acquire a resource lock for a task.
-func (s *Store) AcquireLock(resourceType, resourceKey, taskID string) (bool, error) {
-	return false, nil
-}
-
-// ReleaseLock releases a resource lock held by a task.
-func (s *Store) ReleaseLock(resourceType, resourceKey, taskID string) error {
-	return nil
 }
