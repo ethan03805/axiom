@@ -1,0 +1,50 @@
+# Axiom Meeseeks Multi-Language Image (Default)
+# Contains Go + Node.js + Python for multi-language projects.
+# See Architecture Section 12.2.
+#
+# This is the default image used when no language-specific image is configured.
+
+FROM golang:1.22-alpine AS go-base
+
+# --- Stage 1: Go toolchain ---
+RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
+# --- Final stage: combine everything ---
+FROM node:20-alpine
+
+# Install system dependencies.
+RUN apk add --no-cache \
+    git \
+    inotify-tools \
+    bash \
+    python3 \
+    py3-pip \
+    && rm -rf /var/cache/apk/*
+
+# Copy Go from the go-base stage.
+COPY --from=go-base /usr/local/go /usr/local/go
+COPY --from=go-base /root/go/bin/golangci-lint /usr/local/bin/golangci-lint
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPATH="/home/axiom/go"
+
+# Install Node.js global tools.
+RUN npm install -g typescript eslint
+
+# Install Python tools.
+RUN pip3 install --no-cache-dir --break-system-packages ruff mypy pytest
+
+# Create non-root user.
+RUN addgroup -g 1000 axiom 2>/dev/null || true && \
+    adduser -u 1000 -G axiom -D -h /home/axiom axiom 2>/dev/null || true
+
+# Create workspace directories.
+RUN mkdir -p /workspace/spec /workspace/staging /workspace/ipc/input /workspace/ipc/output && \
+    chown -R axiom:axiom /workspace && \
+    mkdir -p /home/axiom/go && chown axiom:axiom /home/axiom/go
+
+COPY docker/ipc-watcher.sh /usr/local/bin/ipc-watcher
+RUN chmod +x /usr/local/bin/ipc-watcher
+
+USER axiom
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/ipc-watcher"]

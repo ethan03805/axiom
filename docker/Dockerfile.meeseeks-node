@@ -1,0 +1,29 @@
+# Axiom Meeseeks Node Image
+# Contains Node.js + npm + TypeScript + eslint for JavaScript/TypeScript projects.
+# See Architecture Section 12.2.
+
+FROM node:20-alpine AS base
+
+RUN apk add --no-cache \
+    git \
+    inotify-tools \
+    bash \
+    && rm -rf /var/cache/apk/*
+
+# Install global TypeScript and eslint.
+RUN npm install -g typescript eslint
+
+# Create non-root user.
+RUN addgroup -g 1000 axiom 2>/dev/null || true && \
+    adduser -u 1000 -G axiom -D -h /home/axiom axiom 2>/dev/null || true
+
+# Create workspace directories.
+RUN mkdir -p /workspace/spec /workspace/staging /workspace/ipc/input /workspace/ipc/output && \
+    chown -R axiom:axiom /workspace
+
+COPY docker/ipc-watcher.sh /usr/local/bin/ipc-watcher
+RUN chmod +x /usr/local/bin/ipc-watcher
+
+USER axiom
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/ipc-watcher"]

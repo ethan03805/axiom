@@ -1,0 +1,37 @@
+# Axiom Meeseeks Go Image
+# Contains Go toolchain + golangci-lint for Go projects.
+# See Architecture Section 12.2.
+#
+# Security: runs as non-root user, no secrets, no network at runtime.
+
+FROM golang:1.22-alpine AS base
+
+# Install build tools and inotify-tools for IPC watching.
+RUN apk add --no-cache \
+    git \
+    inotify-tools \
+    bash \
+    && rm -rf /var/cache/apk/*
+
+# Install golangci-lint.
+RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
+# Create non-root user per Architecture Section 12.6.1.
+RUN addgroup -g 1000 axiom && \
+    adduser -u 1000 -G axiom -D -h /home/axiom axiom
+
+# Create workspace directories per Architecture Section 12.3.
+RUN mkdir -p /workspace/spec /workspace/staging /workspace/ipc/input /workspace/ipc/output && \
+    chown -R axiom:axiom /workspace
+
+# Copy IPC watcher script.
+COPY docker/ipc-watcher.sh /usr/local/bin/ipc-watcher
+RUN chmod +x /usr/local/bin/ipc-watcher
+
+# Switch to non-root user.
+USER axiom
+WORKDIR /workspace
+
+# Default entrypoint: run the IPC watcher.
+# The engine delivers TaskSpecs via IPC; the agent processes them.
+ENTRYPOINT ["/usr/local/bin/ipc-watcher"]
