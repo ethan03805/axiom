@@ -103,6 +103,61 @@ func (db *DB) GetLockedResources() ([]Lock, error) {
 	return locks, rows.Err()
 }
 
+// CheckAllLocksAvailable checks if ALL the requested locks can be acquired.
+// Returns true if all are available, false if any are held.
+// If unavailable, returns the task ID holding the first conflicting lock.
+func (db *DB) CheckAllLocksAvailable(locks []LockRequest) (bool, string, error) {
+	for _, lock := range locks {
+		locked, holder, err := db.IsLocked(lock.ResourceType, lock.ResourceKey)
+		if err != nil {
+			return false, "", err
+		}
+		if locked {
+			return false, holder, nil
+		}
+	}
+	return true, "", nil
+}
+
+// BuildLocksFromTargetFiles converts a task's target files into lock requests
+// using each file's declared lock scope.
+func (db *DB) BuildLocksFromTargetFiles(taskID string) ([]LockRequest, error) {
+	files, err := db.GetTaskTargetFiles(taskID)
+	if err != nil {
+		return nil, err
+	}
+	locks := make([]LockRequest, len(files))
+	for i, f := range files {
+		locks[i] = LockRequest{
+			ResourceType: f.LockScope,
+			ResourceKey:  f.FilePath,
+		}
+	}
+	return locks, nil
+}
+
+// GetLocksByTask returns all locks currently held by a specific task.
+func (db *DB) GetLocksByTask(taskID string) ([]Lock, error) {
+	rows, err := db.conn.Query(
+		"SELECT resource_type, resource_key, task_id, locked_at FROM task_locks WHERE task_id = ? ORDER BY resource_type, resource_key",
+		taskID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get locks by task: %w", err)
+	}
+	defer rows.Close()
+
+	var locks []Lock
+	for rows.Next() {
+		var l Lock
+		if err := rows.Scan(&l.ResourceType, &l.ResourceKey, &l.TaskID, &l.LockedAt); err != nil {
+			return nil, fmt.Errorf("scan lock: %w", err)
+		}
+		locks = append(locks, l)
+	}
+	return locks, rows.Err()
+}
+
 // IsLocked checks if a resource is currently locked.
 // Returns whether it's locked and the holding task ID.
 func (db *DB) IsLocked(resourceType, resourceKey string) (bool, string, error) {

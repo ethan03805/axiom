@@ -349,6 +349,135 @@ func (db *DB) AddTaskTargetFile(taskID, filePath, lockScope string) error {
 	return nil
 }
 
+// GetTaskTargetFiles returns all target file paths and lock scopes for a task.
+func (db *DB) GetTaskTargetFiles(taskID string) ([]TaskTargetFile, error) {
+	rows, err := db.conn.Query(
+		"SELECT task_id, file_path, lock_scope FROM task_target_files WHERE task_id = ?", taskID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get target files: %w", err)
+	}
+	defer rows.Close()
+
+	var files []TaskTargetFile
+	for rows.Next() {
+		var f TaskTargetFile
+		if err := rows.Scan(&f.TaskID, &f.FilePath, &f.LockScope); err != nil {
+			return nil, fmt.Errorf("scan target file: %w", err)
+		}
+		files = append(files, f)
+	}
+	return files, rows.Err()
+}
+
+// GetTaskSRSRefs returns all SRS references for a task.
+func (db *DB) GetTaskSRSRefs(taskID string) ([]string, error) {
+	rows, err := db.conn.Query(
+		"SELECT srs_ref FROM task_srs_refs WHERE task_id = ?", taskID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get srs refs: %w", err)
+	}
+	defer rows.Close()
+
+	var refs []string
+	for rows.Next() {
+		var ref string
+		if err := rows.Scan(&ref); err != nil {
+			return nil, fmt.Errorf("scan srs ref: %w", err)
+		}
+		refs = append(refs, ref)
+	}
+	return refs, rows.Err()
+}
+
+// GetTaskDependencies returns the IDs of all tasks that the given task depends on.
+func (db *DB) GetTaskDependencies(taskID string) ([]string, error) {
+	rows, err := db.conn.Query(
+		"SELECT depends_on FROM task_dependencies WHERE task_id = ?", taskID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get dependencies: %w", err)
+	}
+	defer rows.Close()
+
+	var deps []string
+	for rows.Next() {
+		var dep string
+		if err := rows.Scan(&dep); err != nil {
+			return nil, fmt.Errorf("scan dependency: %w", err)
+		}
+		deps = append(deps, dep)
+	}
+	return deps, rows.Err()
+}
+
+// GetWaitingOnLockTasks returns tasks in 'waiting_on_lock' status that were
+// blocked by the given task ID. Used to re-queue tasks when locks are released.
+// See Architecture Section 10.7 (Lock Conflict During Scope Expansion).
+func (db *DB) GetWaitingOnLockTasks(blockedByTaskID string) ([]*Task, error) {
+	// waiting_on_lock tasks record the blocking task in the description field
+	// as "blocked_by:<task-id>". This is a simple approach that avoids adding
+	// another column; a production system might use a dedicated column.
+	rows, err := db.conn.Query(`
+		SELECT id, parent_id, title, description, status, tier, task_type,
+		       base_snapshot, eco_ref, created_at, completed_at
+		FROM tasks
+		WHERE status = 'waiting_on_lock'
+		  AND description LIKE ?
+		ORDER BY created_at`,
+		"blocked_by:"+blockedByTaskID+"%",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get waiting on lock tasks: %w", err)
+	}
+	defer rows.Close()
+
+	var tasks []*Task
+	for rows.Next() {
+		task := &Task{}
+		var parentID, ecoRef sql.NullString
+		err := rows.Scan(
+			&task.ID, &parentID, &task.Title, &task.Description,
+			&task.Status, &task.Tier, &task.TaskType, &task.BaseSnapshot,
+			&ecoRef, &task.CreatedAt, &task.CompletedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan task: %w", err)
+		}
+		task.ParentID = parentID.String
+		task.EcoRef = ecoRef.String
+		tasks = append(tasks, task)
+	}
+	return tasks, rows.Err()
+}
+
+// SetTaskWaitingOnLock transitions a task to waiting_on_lock and records
+// the blocking task and requested expansion files in the description.
+func (db *DB) SetTaskWaitingOnLock(taskID, blockedByTaskID string, expandedFiles []string) error {
+	if err := db.UpdateTaskStatus(taskID, TaskStatusWaitingOnLock); err != nil {
+		return err
+	}
+	desc := fmt.Sprintf("blocked_by:%s files:%v", blockedByTaskID, expandedFiles)
+	_, err := db.conn.Exec("UPDATE tasks SET description = ? WHERE id = ?", desc, taskID)
+	if err != nil {
+		return fmt.Errorf("update waiting description: %w", err)
+	}
+	return nil
+}
+
+// GetChildTasks returns all direct child tasks of the given parent task.
+func (db *DB) GetChildTasks(parentID string) ([]*Task, error) {
+	return db.ListTasks(TaskFilter{ParentID: parentID})
+}
+
+// TaskTargetFile represents a file that a task is expected to modify.
+type TaskTargetFile struct {
+	TaskID    string
+	FilePath  string
+	LockScope string // "file" | "package" | "module" | "schema"
+}
+
 // nullString returns a sql.NullString for optional string fields.
 func nullString(s string) sql.NullString {
 	if s == "" {
