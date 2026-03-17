@@ -1,0 +1,1 @@
+Build a REST API using Express.js with three endpoints: GET /api/users (list all users), POST /api/users (create a user with name and email), and GET /api/users/:id (get a specific user). Store users in memory. Include input validation and proper error responses.

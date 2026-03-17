@@ -1,0 +1,1 @@
+Build a Flask web application with a SQLite database for managing a todo list. Include endpoints for: listing all todos, creating a new todo, marking a todo as complete, and deleting a todo. Include basic HTML templates.

@@ -1,0 +1,1 @@
+Build a simple CLI tool in Go that takes a filename as argument and counts the number of lines, words, and characters in the file. It should output the results in a formatted table. Handle errors gracefully (missing file, permission denied).
