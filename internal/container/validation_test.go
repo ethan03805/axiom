@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +10,21 @@ import (
 	"github.com/ethan03805/axiom/internal/events"
 	"github.com/ethan03805/axiom/internal/state"
 )
+
+// writeValidationResult writes a mock validation result JSON file to the given
+// directory. When this directory is the project root, the overlay copy will
+// pick it up as part of the base layer, simulating the container having written
+// results to the mounted working directory.
+func writeValidationResult(t *testing.T, dir string, result validationResultJSON) {
+	t.Helper()
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal validation result: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, validationResultFile), data, 0644); err != nil {
+		t.Fatalf("write validation result: %v", err)
+	}
+}
 
 func setupTestValidation(t *testing.T) (*ValidationSandbox, *mockDockerClient) {
 	t.Helper()
@@ -35,12 +51,12 @@ func setupTestValidation(t *testing.T) (*ValidationSandbox, *mockDockerClient) {
 	emitter := events.NewEmitter()
 
 	config := ValidationConfig{
-		Image:          "axiom-meeseeks-go:latest",
-		CPULimit:       1.0,
-		MemoryLimit:    "4g",
-		TimeoutMinutes: 10,
-		Network:        "none",
-		SecurityScan:   false,
+		Image:           "axiom-meeseeks-go:latest",
+		CPULimit:        1.0,
+		MemoryLimit:     "4g",
+		TimeoutMinutes:  10,
+		Network:         "none",
+		SecurityScan:    false,
 		AllowDepInstall: true,
 	}
 
@@ -59,20 +75,25 @@ func TestValidationSandboxSpawnsContainer(t *testing.T) {
 	vs, mock := setupTestValidation(t)
 	ctx := context.Background()
 
-	_ = mock // used for verification below
+	// Write a passing validation result in the project root so the overlay
+	// copy picks it up. The mock docker client returns an empty container
+	// list, so isContainerRunning returns false immediately (simulating the
+	// container having already exited).
+	writeValidationResult(t, vs.projectRoot, validationResultJSON{
+		CompilePass: true,
+		LintPass:    true,
+		TestPass:    true,
+		TestCount:   5,
+		TestPassed:  5,
+	})
 
 	// Create a staging directory with some output.
 	stagingDir, _ := os.MkdirTemp("", "axiom-staging-*")
 	defer os.RemoveAll(stagingDir)
 	os.WriteFile(filepath.Join(stagingDir, "main.go"), []byte("package main"), 0644)
 
-	// The validate call will fail to find the result file since the mock
-	// container doesn't actually run. This is expected -- we verify the
-	// container was created with correct config. The error from missing
-	// result file is a known test limitation when not using real Docker.
 	result, err := vs.Validate(ctx, "task-val", stagingDir, vs.projectRoot)
-	// Accept either success or the "result file not found" error.
-	if err != nil && result == nil {
+	if err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 
@@ -114,15 +135,37 @@ func TestValidationSandboxSpawnsContainer(t *testing.T) {
 		t.Errorf("expected 1 container removed, got %d", len(mock.removed))
 	}
 
-	// Verify result is returned.
+	// Verify result contains the values from the result file.
 	if result == nil {
 		t.Fatal("expected non-nil result")
+	}
+	if !result.CompilePass {
+		t.Error("expected CompilePass=true")
+	}
+	if !result.LintPass {
+		t.Error("expected LintPass=true")
+	}
+	if !result.TestPass {
+		t.Error("expected TestPass=true")
+	}
+	if result.TestCount != 5 {
+		t.Errorf("expected TestCount=5, got %d", result.TestCount)
+	}
+	if result.TestPassed != 5 {
+		t.Errorf("expected TestPassed=5, got %d", result.TestPassed)
 	}
 }
 
 func TestValidationSandboxRecordsSession(t *testing.T) {
 	vs, _ := setupTestValidation(t)
 	ctx := context.Background()
+
+	// Write a result file so the validation completes successfully.
+	writeValidationResult(t, vs.projectRoot, validationResultJSON{
+		CompilePass: true,
+		LintPass:    true,
+		TestPass:    true,
+	})
 
 	stagingDir, _ := os.MkdirTemp("", "axiom-staging-*")
 	defer os.RemoveAll(stagingDir)
@@ -140,16 +183,20 @@ func TestValidationSandboxRecordsSession(t *testing.T) {
 	if sessions[0].ContainerType != "validator" {
 		t.Errorf("expected validator, got %s", sessions[0].ContainerType)
 	}
-	// Exit reason is "completed" when the result file is found, or "error"
-	// when the mock container exits without writing it. Both are acceptable.
-	if sessions[0].ExitReason != "completed" && sessions[0].ExitReason != "error" {
-		t.Errorf("expected completed or error, got %s", sessions[0].ExitReason)
+	if sessions[0].ExitReason != "completed" {
+		t.Errorf("expected completed, got %s", sessions[0].ExitReason)
 	}
 }
 
 func TestValidationSandboxUsesCorrectImage(t *testing.T) {
 	vs, mock := setupTestValidation(t)
 	ctx := context.Background()
+
+	writeValidationResult(t, vs.projectRoot, validationResultJSON{
+		CompilePass: true,
+		LintPass:    true,
+		TestPass:    true,
+	})
 
 	stagingDir, _ := os.MkdirTemp("", "axiom-staging-*")
 	defer os.RemoveAll(stagingDir)
@@ -159,6 +206,181 @@ func TestValidationSandboxUsesCorrectImage(t *testing.T) {
 	// Image should match the configured validation image (same family as Meeseeks).
 	if mock.created[0].Config.Image != "axiom-meeseeks-go:latest" {
 		t.Errorf("expected axiom-meeseeks-go:latest, got %s", mock.created[0].Config.Image)
+	}
+}
+
+func TestValidationSandboxNoResultFile(t *testing.T) {
+	vs, _ := setupTestValidation(t)
+	ctx := context.Background()
+
+	// Do NOT write a result file -- simulates container crash.
+	stagingDir, _ := os.MkdirTemp("", "axiom-staging-*")
+	defer os.RemoveAll(stagingDir)
+
+	result, err := vs.Validate(ctx, "task-val", stagingDir, vs.projectRoot)
+
+	// Should return an error indicating the container did not write results.
+	if err == nil {
+		t.Fatal("expected error when result file is missing")
+	}
+
+	// Should still return a non-nil result with failing checks.
+	if result == nil {
+		t.Fatal("expected non-nil result even on error")
+	}
+	if result.CompilePass {
+		t.Error("expected CompilePass=false for missing result file")
+	}
+	if result.LintPass {
+		t.Error("expected LintPass=false for missing result file")
+	}
+	if result.TestPass {
+		t.Error("expected TestPass=false for missing result file")
+	}
+}
+
+func TestValidationSandboxFailingResult(t *testing.T) {
+	vs, _ := setupTestValidation(t)
+	ctx := context.Background()
+
+	// Write a failing validation result.
+	writeValidationResult(t, vs.projectRoot, validationResultJSON{
+		CompilePass:  true,
+		LintPass:     false,
+		LintError:    "src/main.go:10: unused variable 'x'",
+		LintWarnings: []string{"line 5: long line"},
+		TestPass:     false,
+		TestError:    "TestFoo: expected 42, got 0",
+		TestCount:    3,
+		TestPassed:   1,
+	})
+
+	stagingDir, _ := os.MkdirTemp("", "axiom-staging-*")
+	defer os.RemoveAll(stagingDir)
+
+	result, err := vs.Validate(ctx, "task-val", stagingDir, vs.projectRoot)
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	if !result.CompilePass {
+		t.Error("expected CompilePass=true")
+	}
+	if result.LintPass {
+		t.Error("expected LintPass=false")
+	}
+	if result.LintError != "src/main.go:10: unused variable 'x'" {
+		t.Errorf("unexpected LintError: %s", result.LintError)
+	}
+	if len(result.LintWarnings) != 1 {
+		t.Errorf("expected 1 lint warning, got %d", len(result.LintWarnings))
+	}
+	if result.TestPass {
+		t.Error("expected TestPass=false")
+	}
+	if result.TestCount != 3 {
+		t.Errorf("expected TestCount=3, got %d", result.TestCount)
+	}
+	if result.TestPassed != 1 {
+		t.Errorf("expected TestPassed=1, got %d", result.TestPassed)
+	}
+}
+
+func TestOverlayCreation(t *testing.T) {
+	vs, _ := setupTestValidation(t)
+
+	// Create project files in the project root.
+	os.WriteFile(filepath.Join(vs.projectRoot, "main.go"), []byte("package main\nfunc main() {}"), 0644)
+	os.MkdirAll(filepath.Join(vs.projectRoot, "pkg"), 0755)
+	os.WriteFile(filepath.Join(vs.projectRoot, "pkg", "lib.go"), []byte("package pkg"), 0644)
+
+	// Create directories that should be skipped.
+	os.MkdirAll(filepath.Join(vs.projectRoot, ".git", "objects"), 0755)
+	os.WriteFile(filepath.Join(vs.projectRoot, ".git", "HEAD"), []byte("ref: refs/heads/main"), 0644)
+	os.MkdirAll(filepath.Join(vs.projectRoot, "node_modules", "some-pkg"), 0755)
+	os.WriteFile(filepath.Join(vs.projectRoot, "node_modules", "some-pkg", "index.js"), []byte("module.exports = {}"), 0644)
+	// .axiom/ is already created by setupTestValidation.
+
+	// Create staging directory with an override and a new file.
+	stagingDir, _ := os.MkdirTemp("", "axiom-staging-*")
+	defer os.RemoveAll(stagingDir)
+	os.WriteFile(filepath.Join(stagingDir, "main.go"), []byte("package main\nfunc main() { fmt.Println(\"hello\") }"), 0644)
+	os.MkdirAll(filepath.Join(stagingDir, "internal"), 0755)
+	os.WriteFile(filepath.Join(stagingDir, "internal", "handler.go"), []byte("package internal"), 0644)
+
+	// Create overlay.
+	workDir, err := vs.createOverlay("task-overlay", stagingDir, vs.projectRoot)
+	if err != nil {
+		t.Fatalf("createOverlay: %v", err)
+	}
+	defer os.RemoveAll(workDir)
+
+	// Verify project files were copied (base layer).
+	if _, err := os.Stat(filepath.Join(workDir, "pkg", "lib.go")); os.IsNotExist(err) {
+		t.Error("expected pkg/lib.go to be copied from project")
+	}
+
+	// Verify skipped directories are NOT in the overlay.
+	if _, err := os.Stat(filepath.Join(workDir, ".git")); !os.IsNotExist(err) {
+		t.Error("expected .git/ to be skipped in overlay")
+	}
+	if _, err := os.Stat(filepath.Join(workDir, ".axiom")); !os.IsNotExist(err) {
+		t.Error("expected .axiom/ to be skipped in overlay")
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "node_modules")); !os.IsNotExist(err) {
+		t.Error("expected node_modules/ to be skipped in overlay")
+	}
+
+	// Verify staging files override project files (overlay layer).
+	mainContent, err := os.ReadFile(filepath.Join(workDir, "main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	if string(mainContent) != "package main\nfunc main() { fmt.Println(\"hello\") }" {
+		t.Errorf("main.go should be the staging version, got: %s", string(mainContent))
+	}
+
+	// Verify new staging files are present.
+	if _, err := os.Stat(filepath.Join(workDir, "internal", "handler.go")); os.IsNotExist(err) {
+		t.Error("expected internal/handler.go from staging to be in overlay")
+	}
+}
+
+func TestOverlayEmptyStagingDir(t *testing.T) {
+	vs, _ := setupTestValidation(t)
+
+	os.WriteFile(filepath.Join(vs.projectRoot, "README.md"), []byte("# Hello"), 0644)
+
+	stagingDir, _ := os.MkdirTemp("", "axiom-staging-empty-*")
+	defer os.RemoveAll(stagingDir)
+
+	workDir, err := vs.createOverlay("task-empty", stagingDir, vs.projectRoot)
+	if err != nil {
+		t.Fatalf("createOverlay: %v", err)
+	}
+	defer os.RemoveAll(workDir)
+
+	// Project file should still be there.
+	if _, err := os.Stat(filepath.Join(workDir, "README.md")); os.IsNotExist(err) {
+		t.Error("expected README.md from project in overlay")
+	}
+}
+
+func TestOverlayMissingStagingDir(t *testing.T) {
+	vs, _ := setupTestValidation(t)
+
+	os.WriteFile(filepath.Join(vs.projectRoot, "go.mod"), []byte("module test"), 0644)
+
+	// Use a nonexistent staging dir.
+	workDir, err := vs.createOverlay("task-nostagingdir", "/nonexistent/staging", vs.projectRoot)
+	if err != nil {
+		t.Fatalf("createOverlay: %v", err)
+	}
+	defer os.RemoveAll(workDir)
+
+	// Project file should still be there.
+	if _, err := os.Stat(filepath.Join(workDir, "go.mod")); os.IsNotExist(err) {
+		t.Error("expected go.mod from project in overlay")
 	}
 }
 
