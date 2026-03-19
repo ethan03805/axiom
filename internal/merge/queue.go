@@ -31,6 +31,7 @@ type MergeItem struct {
 
 // MergeResult holds the outcome of processing a merge item.
 type MergeResult struct {
+	TaskID       string   // The task ID this merge result belongs to
 	Success      bool
 	CommitSHA    string
 	Error        string
@@ -114,7 +115,9 @@ func (q *Queue) ProcessNext() (*MergeResult, bool) {
 
 // processItem executes the 10-step merge process from Architecture Section 16.4.
 func (q *Queue) processItem(item *MergeItem) *MergeResult {
-	result := &MergeResult{}
+	result := &MergeResult{
+		TaskID: item.TaskID,
+	}
 
 	// Step 1: Receive approved output (already done via Submit).
 

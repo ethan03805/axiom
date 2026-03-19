@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e_test contains end-to-end tests that simulate the complete
 // Axiom project lifecycle from prompt to committed code.
 //

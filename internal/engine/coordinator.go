@@ -62,6 +62,7 @@ type Coordinator struct {
 	secretScanner *security.SecretScanner
 	orchestratorMgr *orchestrator.Embedded
 	validationSandbox *container.ValidationSandbox
+	taskSpecBuilder *TaskSpecBuilder
 
 	// Runtime state
 	mu          sync.Mutex
@@ -217,6 +218,10 @@ func NewCoordinator(config *Config, projectRoot string) (*Coordinator, error) {
 	// Initialize secret scanner.
 	// See Architecture Section 29.4.
 	c.secretScanner = security.NewSecretScanner(config.Security.SensitivePatterns)
+
+	// Initialize TaskSpec builder.
+	// See Architecture Section 10.3.
+	c.taskSpecBuilder = NewTaskSpecBuilder(db, c.secretScanner, projectRoot)
 
 	// Register IPC handlers.
 	// See Architecture Section 20.4 for the message type routing table.
@@ -526,6 +531,9 @@ func (c *Coordinator) executionLoop() {
 				continue
 			}
 
+			// Dispatch ready tasks to containers.
+			c.dispatchReadyTasks()
+
 			// Process the merge queue (serialized, one at a time).
 			c.processMergeQueue()
 
@@ -550,13 +558,25 @@ func (c *Coordinator) processMergeQueue() {
 	if result.Success {
 		// Lock release and dependent task unblocking.
 		// This is steps 9-10 from Architecture Section 16.4.
-		taskID := "" // The merge result should carry the task ID.
-		if taskID != "" {
-			c.workQueue.CompleteTask(taskID)
+		if result.TaskID != "" {
+			if err := c.workQueue.CompleteTask(result.TaskID); err != nil {
+				c.emitter.Emit(events.Event{
+					Type:   events.EventTaskFailed,
+					TaskID: result.TaskID,
+					Details: map[string]interface{}{
+						"error": fmt.Sprintf("complete task after merge: %v", err),
+					},
+				})
+			}
+			_ = c.db.UpdateTaskStatus(result.TaskID, state.TaskStatusDone)
 		}
 	} else if result.NeedsRequeue {
 		// Task needs to be re-queued with updated context.
-		// The merge queue already logged the event.
+		// Reset to queued so it will be picked up again with fresh context.
+		if result.TaskID != "" {
+			_ = c.workQueue.FailTask(result.TaskID)
+			_ = c.db.UpdateTaskStatus(result.TaskID, state.TaskStatusQueued)
+		}
 	}
 }
 
@@ -687,7 +707,13 @@ func (c *Coordinator) handleTaskOutput(taskID string, msg interface{}, raw []byt
 	)
 
 	if pipeResult.Approved {
-		// Submit to merge queue.
+		// Read staged files and construct a MergeItem for the merge queue.
+		mergeItem, mergeErr := c.buildMergeItem(taskID, stagingDir, outputMsg.BaseSnapshot, task)
+		if mergeErr != nil {
+			return nil, fmt.Errorf("build merge item: %w", mergeErr)
+		}
+		c.mergeQueue.Submit(mergeItem)
+
 		c.emitter.Emit(events.Event{
 			Type:   events.EventTaskCompleted,
 			TaskID: taskID,
@@ -743,6 +769,263 @@ func (c *Coordinator) handleReviewResult(taskID string, msg interface{}, raw []b
 	return nil, nil
 }
 
+// dispatchReadyTasks finds tasks that are ready to execute, acquires their locks,
+// builds TaskSpecs, and spawns Meeseeks containers. This is the core dispatch
+// cycle from Architecture Section 5.1 step 7.
+func (c *Coordinator) dispatchReadyTasks() {
+	dispatchable, err := c.workQueue.GetDispatchable()
+	if err != nil {
+		c.emitter.Emit(events.Event{
+			Type:      events.EventTaskFailed,
+			AgentType: "engine",
+			Details: map[string]interface{}{
+				"error": fmt.Sprintf("get dispatchable tasks: %v", err),
+			},
+		})
+		return
+	}
+
+	for _, dt := range dispatchable {
+		task := dt.Task
+		locks := dt.Locks
+
+		// Acquire locks and transition to in_progress.
+		acquired, err := c.workQueue.AcquireAndDispatch(task.ID, locks)
+		if err != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: task.ID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("acquire and dispatch: %v", err),
+				},
+			})
+			continue
+		}
+		if !acquired {
+			// Race condition: another dispatch grabbed the locks. Skip.
+			continue
+		}
+
+		// Get the base snapshot (current HEAD SHA).
+		baseSnapshot, err := c.gitMgr.HeadSHA()
+		if err != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: task.ID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("get HEAD SHA: %v", err),
+				},
+			})
+			_ = c.workQueue.FailTask(task.ID)
+			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			continue
+		}
+
+		// Get SRS references for this task.
+		srsRefs, err := c.db.GetTaskSRSRefs(task.ID)
+		if err != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: task.ID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("get SRS refs: %v", err),
+				},
+			})
+			_ = c.workQueue.FailTask(task.ID)
+			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			continue
+		}
+
+		// Get target files for this task.
+		targetFiles, err := c.db.GetTaskTargetFiles(task.ID)
+		if err != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: task.ID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("get target files: %v", err),
+				},
+			})
+			_ = c.workQueue.FailTask(task.ID)
+			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			continue
+		}
+		filePaths := make([]string, len(targetFiles))
+		for i, f := range targetFiles {
+			filePaths[i] = f.FilePath
+		}
+
+		// Build the TaskSpecRequest from task metadata.
+		specReq := &TaskSpecRequest{
+			Task:        task,
+			ContextTier: TierFile, // Default; orchestrator may override via task metadata.
+			SRSRefs:     srsRefs,
+			TargetFiles: filePaths,
+		}
+
+		// Build the TaskSpec.
+		specContent, err := c.taskSpecBuilder.Build(specReq, baseSnapshot)
+		if err != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: task.ID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("build TaskSpec: %v", err),
+				},
+			})
+			_ = c.workQueue.FailTask(task.ID)
+			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			continue
+		}
+
+		// Write the TaskSpec to the spec directory.
+		specDir := filepath.Join(c.projectRoot, ".axiom", "containers", "specs", task.ID)
+		if err := os.MkdirAll(specDir, 0755); err != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: task.ID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("create spec dir: %v", err),
+				},
+			})
+			_ = c.workQueue.FailTask(task.ID)
+			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			continue
+		}
+		specPath := filepath.Join(specDir, "spec.md")
+		if err := os.WriteFile(specPath, []byte(specContent), 0644); err != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: task.ID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("write spec file: %v", err),
+				},
+			})
+			_ = c.workQueue.FailTask(task.ID)
+			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			continue
+		}
+
+		// Send the TaskSpec via IPC.
+		ipcMsg := &ipc.TaskSpecMessage{
+			Header: ipc.Header{
+				Type:   ipc.TypeTaskSpec,
+				TaskID: task.ID,
+			},
+			Spec: specContent,
+		}
+		if err := c.ipcWriter.Send(task.ID, ipcMsg); err != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: task.ID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("send TaskSpec via IPC: %v", err),
+				},
+			})
+			_ = c.workQueue.FailTask(task.ID)
+			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			continue
+		}
+
+		// Spawn a Meeseeks container.
+		if c.containerMgr != nil {
+			_, err = c.containerMgr.SpawnMeeseeks(context.Background(), container.SpawnRequest{
+				TaskID:      task.ID,
+				Image:       c.config.Docker.Image,
+				ModelID:     "", // Model selection is handled by the inference broker.
+				CPULimit:    c.config.Docker.CPULimit,
+				MemoryLimit: c.config.Docker.MemLimit,
+				TimeoutMin:  c.config.Docker.TimeoutMinutes,
+			})
+			if err != nil {
+				c.emitter.Emit(events.Event{
+					Type:   events.EventTaskFailed,
+					TaskID: task.ID,
+					Details: map[string]interface{}{
+						"error": fmt.Sprintf("spawn Meeseeks: %v", err),
+					},
+				})
+				_ = c.workQueue.FailTask(task.ID)
+				_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+				continue
+			}
+		}
+
+		// Start watching this task's IPC output directory.
+		if err := c.ipcWatcher.WatchTask(task.ID); err != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: task.ID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("watch task IPC: %v", err),
+				},
+			})
+			// Container is already spawned; don't fail the task, just log.
+		}
+	}
+}
+
+// buildMergeItem reads staged files and constructs a MergeItem for submission
+// to the merge queue. Called after the approval pipeline approves task output.
+func (c *Coordinator) buildMergeItem(taskID, stagingDir, baseSnapshot string, task *state.Task) (*merge.MergeItem, error) {
+	// Parse the manifest to identify files.
+	manifest, err := pipeline.ParseManifest(stagingDir)
+	if err != nil {
+		return nil, fmt.Errorf("parse manifest: %w", err)
+	}
+
+	// Read file contents from staging.
+	files := make(map[string]string)
+	for _, f := range manifest.Files.Added {
+		if f.Binary {
+			continue // Binary files are handled separately.
+		}
+		content, readErr := os.ReadFile(filepath.Join(stagingDir, f.Path))
+		if readErr != nil {
+			return nil, fmt.Errorf("read staged file %s: %w", f.Path, readErr)
+		}
+		files[f.Path] = string(content)
+	}
+	for _, f := range manifest.Files.Modified {
+		if f.Binary {
+			continue
+		}
+		content, readErr := os.ReadFile(filepath.Join(stagingDir, f.Path))
+		if readErr != nil {
+			return nil, fmt.Errorf("read staged file %s: %w", f.Path, readErr)
+		}
+		files[f.Path] = string(content)
+	}
+	// Handle renames: read the new file content.
+	for _, r := range manifest.Files.Renamed {
+		content, readErr := os.ReadFile(filepath.Join(stagingDir, r.To))
+		if readErr != nil {
+			return nil, fmt.Errorf("read renamed file %s: %w", r.To, readErr)
+		}
+		files[r.To] = string(content)
+	}
+
+	// Collect deletions.
+	deletions := make([]string, len(manifest.Files.Deleted))
+	copy(deletions, manifest.Files.Deleted)
+	// Renames also delete the old path.
+	for _, r := range manifest.Files.Renamed {
+		deletions = append(deletions, r.From)
+	}
+
+	// Get SRS refs for the commit metadata.
+	srsRefs, _ := c.db.GetTaskSRSRefs(taskID)
+
+	return &merge.MergeItem{
+		TaskID:       taskID,
+		TaskTitle:    task.Title,
+		StagingDir:   stagingDir,
+		BaseSnapshot: baseSnapshot,
+		Files:        files,
+		Deletions:    deletions,
+		SRSRefs:      srsRefs,
+	}, nil
+}
 
 // DB returns the state database.
 func (c *Coordinator) DB() *state.DB { return c.db }
