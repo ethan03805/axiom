@@ -14,7 +14,7 @@ The Axiom codebase has substantial implementation across all 24 build plan phase
 
 The critical engine wiring gap has been resolved: a new `Coordinator` type wires all 13 subsystems together, registers IPC handlers, runs crash recovery (including container orphan cleanup, staging cleanup, and SRS integrity verification), and provides a background execution loop. CLI commands are now wired to the Coordinator. Docker images and skill templates have been created.
 
-**Overall Completeness: ~88-90%**
+**Overall Completeness: ~92-94%**
 
 ---
 
@@ -53,7 +53,7 @@ All critical gaps resolved:
 - Tests: `TestNewCoordinator`, `TestCoordinatorEventPersistence`, `TestCoordinatorCrashRecovery`, `TestCoordinatorPauseResume`, `TestCoordinatorCompletionPercentage`
 
 **Remaining:**
-- [ ] Wire TaskSpec construction into the execution loop (requires semantic indexer for context building)
+- [ ] Wire TaskSpecBuilder into the execution loop dispatch cycle (semantic indexer provides context)
 - [ ] Add API server startup to coordinator (currently not auto-started)
 
 ---
@@ -86,14 +86,12 @@ Was already complete. IPC handlers now registered via Coordinator. `MkdirAll` ad
 ### Phase 4: Inference Broker -- DONE
 
 **Spec Compliance:** 10/10
-**Completeness:** 9/10
+**Completeness:** 10/10
 
-Now wired to IPC dispatcher via Coordinator. Code quality fixes applied:
+Fully complete. Code quality fixes applied:
 - `IPCBaseDir` added to `broker.Config` (was hardcoded)
 - `AgentType` field added to `InferenceRequest` (was hardcoded "meeseeks")
-
-**Remaining:**
-- [ ] Add retry with exponential backoff for 429/5xx in OpenRouter client
+- Exponential backoff retry for OpenRouter: retries on 429/5xx, max 3 retries with 1s/2s/4s backoff, reads Retry-After header
 
 ---
 
@@ -243,18 +241,20 @@ Previously 6/10. Now complete:
 
 ---
 
-### Phase 14: BitNet Local Inference
+### Phase 14: BitNet Local Inference -- DONE
 
-**Spec Compliance:** 7/10
-**Completeness:** 6/10
+**Spec Compliance:** 9/10
+**Completeness:** 8/10
 
-Unchanged. See original assessment.
+Previously 6/10. Now implemented:
+- BitNet server lifecycle management: Start/Stop/Status methods
+- Process management with SIGINT/SIGKILL and graceful shutdown timeout
+- Weight directory checking (`~/.axiom/bitnet/models/`)
+- CLI wired: `axiom bitnet start` (with weight download prompt), `stop`, `status`, `models`
 
 **Remaining:**
-- [ ] Implement model weight download on first run
-- [ ] Implement server process management
-- [ ] Implement resource monitoring
-- [ ] Wire CLI commands
+- [ ] Actual model weight download implementation (currently stubs directory creation)
+- [ ] Resource monitoring (CPU/memory tracking for BitNet process)
 
 ---
 
@@ -272,9 +272,7 @@ Previously 6/10. Major improvements:
 - `loadCoordinator()` helper for commands needing an existing project
 
 **Remaining:**
-- [ ] Wire `axiom api start/stop` and `axiom api token` commands to API server
-- [ ] Wire `axiom bitnet` commands to BitNet server management
-- [ ] Wire `axiom index` commands to semantic indexer
+- [ ] Wire `axiom index` commands to semantic indexer (blocked on Phase 8 go/ast improvements)
 
 ---
 
@@ -289,8 +287,7 @@ Previously 8/10. Improvements:
 - WebSocket broadcast now filters by project ID
 - `MkdirAll` added to IPC Writer for input directory creation
 
-**Remaining:**
-- [ ] Add `Retry-After` header to 429 responses
+All items complete. `Retry-After` header added via `SecondsUntilReset()` on RateLimiter.
 
 ---
 
@@ -417,13 +414,17 @@ The `Coordinator` type in `internal/engine/coordinator.go` now holds references 
 
 The Coordinator has a background `executionLoop()` that processes the merge queue, checks budget thresholds, and monitors completion. The missing piece is **TaskSpec construction** -- the loop needs to query the work queue for dispatchable tasks, build TaskSpecs using the semantic indexer, and spawn Meeseeks containers. This is blocked on the semantic indexer (Phase 8).
 
-### 3. TaskSpec Construction -- REMAINING
+### 3. TaskSpec Construction -- RESOLVED
 
-Still needs implementation. Requires:
-- Semantic index queries for context building
+`TaskSpecBuilder` (`internal/engine/taskspec.go`) implements:
+- Full TaskSpec markdown rendering per Architecture Section 10.3
+- All 4 context tiers (symbol, file, package, repo-map)
 - Secret scanning and redaction via `PrepareContextForPrompt()`
-- Base snapshot pinning via `git.HeadSHA()`
-- Template rendering for the TaskSpec markdown format
+- Base snapshot pinning
+- Retry feedback inclusion for failed attempts
+- `.env` and `.axiom/` exclusion from context
+
+Still needs: wiring into the execution loop dispatch cycle (TaskSpecBuilder.Build -> IPC Writer -> container spawn).
 
 ### 4. CLI-to-Engine Bridge -- RESOLVED
 
@@ -436,7 +437,7 @@ Still needs implementation. Requires:
 ### P0 -- Required for end-to-end execution
 1. ~~Wire Engine to all subsystems~~ -- DONE (Coordinator)
 2. ~~Implement main execution loop~~ -- DONE (partial: merge queue + budget + completion)
-3. Implement TaskSpec construction pipeline (blocked on Phase 8 semantic indexer)
+3. ~~Implement TaskSpec construction pipeline~~ -- DONE (TaskSpecBuilder with security + context tiers)
 4. ~~Wire CLI commands to engine~~ -- DONE
 5. ~~Create Docker images~~ -- DONE
 6. ~~Wire IPC handlers for all message types~~ -- DONE
@@ -460,7 +461,7 @@ Still needs implementation. Requires:
 18. GUI dashboard views
 19. Warm sandbox pools (behind feature flag, infrastructure exists)
 20. Context invalidation warnings
-21. BitNet server lifecycle management
+21. ~~BitNet server lifecycle management~~ -- DONE
 22. ~~Persistent API token storage~~ -- DONE
 23. End-to-end test suite
 
@@ -485,6 +486,6 @@ Still needs implementation. Requires:
 - ~~`broker.go:ipcWriterBaseDir` hardcodes path~~ -- Fixed: added `IPCBaseDir` to `broker.Config`
 
 **Remaining issues:**
-- Semantic indexer lacks tree-sitter integration (uses go/ast or stubs)
-- No TaskSpec construction pipeline (blocked on semantic indexer)
+- Semantic indexer uses go/ast for Go only; other languages need parsers (or tree-sitter)
 - GUI React frontend views not implemented
+- Execution loop dispatch cycle not yet wired (TaskSpecBuilder -> IPC -> container spawn)
