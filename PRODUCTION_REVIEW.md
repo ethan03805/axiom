@@ -14,7 +14,7 @@ The Axiom codebase has substantial implementation across all 24 build plan phase
 
 The critical engine wiring gap has been resolved: a new `Coordinator` type wires all 13 subsystems together, registers IPC handlers, runs crash recovery (including container orphan cleanup, staging cleanup, and SRS integrity verification), and provides a background execution loop. CLI commands are now wired to the Coordinator. Docker images and skill templates have been created.
 
-**Overall Completeness: ~80-85%**
+**Overall Completeness: ~88-90%**
 
 ---
 
@@ -226,20 +226,22 @@ Budget enforcement now wired end-to-end via Coordinator:
 
 ---
 
-### Phase 13: Model Registry
+### Phase 13: Model Registry -- DONE
 
-**Spec Compliance:** 7/10
-**Completeness:** 6/10
+**Spec Compliance:** 9/10
+**Completeness:** 9/10
 
-Unchanged. See original assessment.
+Previously 6/10. Now complete:
+- `~/.axiom/registry.db` SQLite database with full schema per Architecture Section 18.3
+- `models.json` curated capability file with 11 models (Claude, GPT, Gemini, Llama, DeepSeek, Falcon3)
+- OpenRouter `/api/v1/models` fetching with tier classification by pricing
+- `MergeCuratedData()` overlays strengths/weaknesses/recommendations onto fetched models
+- `SelectForTask()` with family diversity support and historical performance ranking
+- `UpdatePerformance()` for post-project success rate tracking
+- CLI wired: `axiom models refresh`, `axiom models list --tier --family`, `axiom models info <id>`
 
 **Remaining:**
-- [ ] Implement `~/.axiom/registry.db` SQLite database
-- [ ] Create curated `models.json`
-- [ ] Implement OpenRouter `/api/v1/models` fetching
-- [ ] Implement historical performance tracking
-- [ ] Implement offline fallback
-- [ ] Wire CLI commands
+- [ ] Implement offline fallback with stale-data warning
 
 ---
 
@@ -280,33 +282,34 @@ Previously 6/10. Major improvements:
 
 ---
 
-### Phase 16: API Server & Claw Integration
+### Phase 16: API Server & Claw Integration -- DONE
 
-**Spec Compliance:** 8/10
-**Completeness:** 8/10
+**Spec Compliance:** 9/10
+**Completeness:** 9/10
 
-Unchanged. Already substantially complete.
+Previously 8/10. Improvements:
+- `internal/api/wiring.go`: `CoordinatorAPI` interface bridges api and engine packages without circular imports; `WireHandlersToCoordinator()` connects all 16 handler callbacks
+- Persistent API token storage in `~/.axiom/api-tokens/` with JSON serialization
+- WebSocket broadcast now filters by project ID
+- `MkdirAll` added to IPC Writer for input directory creation
 
 **Remaining:**
-- [ ] Wire handler callbacks to coordinator operations
-- [ ] Implement persistent token storage in `~/.axiom/api-tokens/`
 - [ ] Add `Retry-After` header to 429 responses
-- [ ] Implement project ID filtering in WebSocket broadcast
 
 ---
 
 ### Phase 17: Skill System -- DONE
 
-**Spec Compliance:** 9/10
-**Completeness:** 8/10
+**Spec Compliance:** 10/10
+**Completeness:** 9/10
 
-Previously 5/10. Skill templates now exist:
-- `skills/claw.md.tmpl`, `skills/claude-code.md.tmpl`, `skills/codex.md.tmpl`, `skills/opencode.md.tmpl`
-- All use Go `text/template` syntax with dynamic fields
-- All cover the 13 content items from Architecture Section 25.3
+Previously 5/10. Now complete:
+- Skill templates for all 4 runtimes covering all 13 content items
+- Template loading and `text/template` rendering implemented in `generator.go`
+- `axiom skill generate --runtime <runtime>` CLI command wired to load config, build TemplateData, and write skill file
+- Output paths per Architecture Section 25.2: `axiom-skill.md`, `.claude/CLAUDE.md`, `codex-instructions.md`, `opencode-instructions.md`
 
 **Remaining:**
-- [ ] Implement template loading/rendering in `internal/skill/generator.go`
 - [ ] Implement config change detection for automatic regeneration
 
 ---
@@ -451,18 +454,18 @@ Still needs implementation. Requires:
 
 ### P2 -- Required for production quality
 12. Complete semantic indexer with tree-sitter (CRITICAL: blocks TaskSpec construction)
-13. Wire API handler callbacks to Coordinator
+13. ~~Wire API handler callbacks to Coordinator~~ -- DONE
 14. ~~Complete `axiom doctor` checks~~ -- DONE
 15. ~~Create skill templates~~ -- DONE
-16. Implement model registry with OpenRouter fetching
-17. Implement template rendering in skill generator
+16. ~~Implement model registry with OpenRouter fetching~~ -- DONE
+17. ~~Implement template rendering in skill generator~~ -- DONE
 
 ### P3 -- Nice to have for initial release
 18. GUI dashboard views
 19. Warm sandbox pools (behind feature flag, infrastructure exists)
 20. Context invalidation warnings
 21. BitNet server lifecycle management
-22. Persistent API token storage
+22. ~~Persistent API token storage~~ -- DONE
 23. End-to-end test suite
 
 ---
@@ -480,7 +483,12 @@ Still needs implementation. Requires:
 - JSON serialization for event persistence (fixed)
 - Cross-platform path handling via `filepath.Join` (fixed)
 
+**Resolved issues:**
+- ~~`tasks.go:GetWaitingOnLockTasks` uses `description LIKE`~~ -- Fixed: added `blocked_by_task_id` column
+- ~~`broker.go:logCost` hardcodes agent type~~ -- Fixed: added `AgentType` field to `InferenceRequest`
+- ~~`broker.go:ipcWriterBaseDir` hardcodes path~~ -- Fixed: added `IPCBaseDir` to `broker.Config`
+
 **Remaining issues:**
-- `tasks.go:GetWaitingOnLockTasks` uses `description LIKE` for blocking task lookup
-- `broker.go:logCost` hardcodes agent type as "meeseeks"
-- `broker.go:ipcWriterBaseDir` hardcodes `.axiom/containers/ipc`
+- Semantic indexer lacks tree-sitter integration (uses go/ast or stubs)
+- No TaskSpec construction pipeline (blocked on semantic indexer)
+- GUI React frontend views not implemented
