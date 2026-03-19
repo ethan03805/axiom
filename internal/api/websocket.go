@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/ethan03805/axiom/internal/events"
@@ -83,7 +84,9 @@ func (h *WSHub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
-// broadcast sends an event to all connected WebSocket clients.
+// broadcast sends an event to connected WebSocket clients, filtered by project ID.
+// A client only receives events whose TaskID starts with the client's registered
+// project ID prefix. Clients registered with an empty project ID receive all events.
 func (h *WSHub) broadcast(event events.Event) {
 	data, err := json.Marshal(event)
 	if err != nil {
@@ -93,12 +96,30 @@ func (h *WSHub) broadcast(event events.Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	for conn := range h.clients {
+	for conn, projectID := range h.clients {
+		// Filter: only send to clients whose project ID matches the event,
+		// or clients subscribed to all events (empty project ID).
+		if projectID != "" && !h.eventMatchesProject(event, projectID) {
+			continue
+		}
+
 		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 			conn.Close()
 			delete(h.clients, conn)
 		}
 	}
+}
+
+// eventMatchesProject determines whether an event belongs to a given project.
+// An event matches if:
+//   - The event's TaskID starts with the project ID prefix, OR
+//   - The event has no TaskID (global events like budget_warning are sent to all).
+func (h *WSHub) eventMatchesProject(event events.Event, projectID string) bool {
+	if event.TaskID == "" {
+		// Global events (no task association) are sent to all clients.
+		return true
+	}
+	return strings.HasPrefix(event.TaskID, projectID)
 }
 
 // ClientCount returns the number of connected WebSocket clients.

@@ -95,6 +95,11 @@ func (s *Server) Auth() *TokenAuth {
 	return s.auth
 }
 
+// Handlers returns the handler struct for external wiring (e.g. WireHandlersToCoordinator).
+func (s *Server) Handlers() *Handlers {
+	return s.handlers
+}
+
 // registerRoutes sets up all REST endpoints per Architecture Section 24.2.
 func (s *Server) registerRoutes(mux *http.ServeMux) {
 	h := s.handlers

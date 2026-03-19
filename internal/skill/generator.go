@@ -5,6 +5,7 @@
 package skill
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,20 +33,30 @@ var OutputPaths = map[Runtime]string{
 	RuntimeOpenCode:   "opencode-instructions.md",
 }
 
+// templateFiles maps each runtime to its template filename in the skills/ directory.
+var templateFiles = map[Runtime]string{
+	RuntimeClaw:       "claw.md.tmpl",
+	RuntimeClaudeCode: "claude-code.md.tmpl",
+	RuntimeCodex:      "codex.md.tmpl",
+	RuntimeOpenCode:   "opencode.md.tmpl",
+}
+
 // TemplateData holds the dynamic content injected into skill templates.
 type TemplateData struct {
-	ProjectName    string
-	ProjectSlug    string
-	BudgetUSD      float64
-	MaxMeeseeks    int
-	Runtime        string
-	APIPort        int
-	BitNetEnabled  bool
-	BitNetPort     int
-	DockerImage    string
-	BranchPrefix   string
-	ModelTiers     string // Summary of model tiers
-	IPCEndpoint    string // IPC or API endpoint info
+	ProjectName       string
+	ProjectSlug       string
+	BudgetUSD         float64
+	BudgetMax         string // Formatted budget string for templates (e.g. "10.00")
+	MaxMeeseeks       int
+	Runtime           string
+	APIPort           int
+	BitNetEnabled     bool
+	BitNetPort        int
+	DockerImage       string
+	BranchPrefix      string
+	ModelTiers        string // Summary of model tiers (legacy field)
+	ModelTiersSummary string // Summary of model tiers used in .tmpl files
+	IPCEndpoint       string // IPC or API endpoint info
 }
 
 // Generator produces runtime-specific skill files from templates.
@@ -55,51 +66,108 @@ type Generator struct {
 	templates   map[Runtime]*template.Template
 }
 
-// NewGenerator creates a skill Generator for the project.
+// NewGenerator creates a skill Generator for the project. It does not load
+// templates; call LoadTemplates or LoadTemplatesFromDir after construction.
 func NewGenerator(projectRoot string) *Generator {
-	g := &Generator{
+	return &Generator{
 		projectRoot: projectRoot,
 		templates:   make(map[Runtime]*template.Template),
 	}
+}
 
-	// Register built-in templates.
-	for _, rt := range []Runtime{RuntimeClaw, RuntimeClaudeCode, RuntimeCodex, RuntimeOpenCode} {
-		tmpl := template.Must(template.New(string(rt)).Parse(getTemplate(rt)))
+// LoadTemplates reads template files from the skills/ directory inside the
+// project root (i.e. the repository root where `skills/*.md.tmpl` live).
+// This is the standard entry point for production use.
+func (g *Generator) LoadTemplates() error {
+	skillsDir := filepath.Join(g.projectRoot, "skills")
+	return g.LoadTemplatesFromDir(skillsDir)
+}
+
+// LoadTemplatesFromDir reads template files from the given directory.
+// Each runtime has a corresponding .md.tmpl file.
+func (g *Generator) LoadTemplatesFromDir(dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("skills directory not found: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("skills path is not a directory: %s", dir)
+	}
+
+	for rt, filename := range templateFiles {
+		tmplPath := filepath.Join(dir, filename)
+		data, err := os.ReadFile(tmplPath)
+		if err != nil {
+			return fmt.Errorf("read template %s: %w", filename, err)
+		}
+
+		tmpl, err := template.New(string(rt)).Parse(string(data))
+		if err != nil {
+			return fmt.Errorf("parse template %s: %w", filename, err)
+		}
+
 		g.templates[rt] = tmpl
 	}
 
-	return g
+	return nil
 }
 
-// Generate produces a skill file for the given runtime with the provided data.
-// Returns the output path and any error.
-func (g *Generator) Generate(runtime Runtime, data *TemplateData) (string, error) {
+// HasTemplates reports whether templates have been loaded.
+func (g *Generator) HasTemplates() bool {
+	return len(g.templates) > 0
+}
+
+// Generate selects the correct template for the given runtime, executes it
+// with the provided data, and returns the rendered content as a string.
+func (g *Generator) Generate(runtime Runtime, data TemplateData) (string, error) {
 	tmpl, ok := g.templates[runtime]
 	if !ok {
-		return "", fmt.Errorf("unsupported runtime: %s", runtime)
+		return "", fmt.Errorf("no template loaded for runtime: %s", runtime)
 	}
 
-	outputPath, ok := OutputPaths[runtime]
-	if !ok {
-		return "", fmt.Errorf("no output path for runtime: %s", runtime)
-	}
-
-	fullPath := filepath.Join(g.projectRoot, outputPath)
-
-	// Ensure parent directory exists.
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		return "", fmt.Errorf("create output dir: %w", err)
-	}
-
-	f, err := os.Create(fullPath)
-	if err != nil {
-		return "", fmt.Errorf("create output file: %w", err)
-	}
-	defer f.Close()
-
+	// Populate computed fields so templates can reference them.
 	data.Runtime = string(runtime)
-	if err := tmpl.Execute(f, data); err != nil {
-		return "", fmt.Errorf("execute template: %w", err)
+	if data.BudgetMax == "" {
+		data.BudgetMax = fmt.Sprintf("%.2f", data.BudgetUSD)
+	}
+	if data.ModelTiersSummary == "" && data.ModelTiers != "" {
+		data.ModelTiersSummary = data.ModelTiers
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("execute template for %s: %w", runtime, err)
+	}
+
+	return buf.String(), nil
+}
+
+// WriteSkillFile renders the template for the given runtime and writes it to
+// the correct output path inside outputDir, per Architecture Section 25.2:
+//   - Claw:       axiom-skill.md
+//   - Claude Code: .claude/CLAUDE.md
+//   - Codex:      codex-instructions.md
+//   - OpenCode:   opencode-instructions.md
+func (g *Generator) WriteSkillFile(runtime Runtime, data TemplateData, outputDir string) (string, error) {
+	content, err := g.Generate(runtime, data)
+	if err != nil {
+		return "", err
+	}
+
+	relPath, ok := OutputPaths[runtime]
+	if !ok {
+		return "", fmt.Errorf("no output path defined for runtime: %s", runtime)
+	}
+
+	fullPath := filepath.Join(outputDir, relPath)
+
+	// Ensure parent directory exists (e.g. .claude/ for Claude Code).
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		return "", fmt.Errorf("create output directory: %w", err)
+	}
+
+	if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+		return "", fmt.Errorf("write skill file: %w", err)
 	}
 
 	return fullPath, nil
@@ -119,190 +187,20 @@ func IsValidRuntime(rt string) bool {
 	return false
 }
 
-// getTemplate returns the built-in template for a runtime.
-// Each template includes all 13 content items from Architecture Section 25.3.
-func getTemplate(rt Runtime) string {
-	// The core content is shared across all runtimes.
-	// Runtime-specific wrappers adjust the framing.
-	switch rt {
-	case RuntimeClaw:
-		return clawTemplate
-	case RuntimeClaudeCode:
-		return claudeCodeTemplate
-	case RuntimeCodex:
-		return codexTemplate
-	case RuntimeOpenCode:
-		return openCodeTemplate
-	default:
-		return ""
-	}
-}
-
-// --- Templates ---
-// Each includes all 13 topics from Architecture Section 25.3.
-
-var sharedContent = `
-## Axiom Workflow
-
-Axiom follows a strict workflow: prompt -> SRS -> approval -> autonomous execution.
-Once the SRS is approved, scope is immutable. Only Engineering Change Orders (ECOs)
-may modify environmental details.
-
-## Trusted Engine vs. Untrusted Agent Plane
-
-The Trusted Engine (Go control plane) executes ALL privileged operations: filesystem
-writes, git commits, container spawning, budget enforcement, model API calls.
-LLM agents (including you) propose actions through structured requests. The engine
-validates, authorizes, and executes them. You CANNOT directly access the filesystem,
-Docker, git, or model APIs.
-
-## Available Request Types
-
-You may submit these requests via {{if eq .Runtime "claw"}}the REST API{{else}}IPC{{end}}:
-- submit_srs: Submit generated SRS for user approval
-- submit_eco: Propose an Engineering Change Order
-- create_task / create_task_batch: Add tasks to the task tree
-- spawn_meeseeks / spawn_reviewer / spawn_sub_orchestrator: Request container spawning
-- approve_output / reject_output: Validate Meeseeks output
-- query_index: Query the semantic code index
-- query_status / query_budget: Get current state
-- request_inference: Submit an inference request to the broker
-
-## TaskSpec Format
-
-Every Meeseeks receives a self-contained TaskSpec with:
-- Base Snapshot (git SHA)
-- Objective (single sentence)
-- Context at the minimum necessary tier (symbol, file, package, repo-map)
-- Interface Contract
-- Constraints (language, style, dependencies)
-- Acceptance Criteria
-- Output Format: files to /workspace/staging/ + manifest.json
-
-## ReviewSpec Format
-
-Reviewers receive: original TaskSpec + Meeseeks output + manifest + validation results.
-They return APPROVE or REJECT with per-criterion evaluation and feedback.
-
-## Context Tiers
-
-Select the MINIMUM tier sufficient for each task:
-1. Symbol-level: function signatures, type definitions
-2. File-level: complete source files
-3. Package-level: full package with dependencies
-4. Repo map: dependency graph, directory structure
-5. Indexed query: dynamic context from semantic index
-
-## Model Tiers
-
-| Tier | Use Cases |
-|------|-----------|
-| Local (BitNet) | Renames, imports, config, boilerplate |
-| Cheap | Simple functions, small modifications |
-| Standard | Most coding tasks, refactoring |
-| Premium | Complex algorithms, APIs, critical code |
-
-Project budget: ${{printf "%.2f" .BudgetUSD}} | Max concurrent Meeseeks: {{.MaxMeeseeks}}
-
-## Budget Management
-
-- Budget is enforced per-request before execution
-- Track spending via query_budget
-- Prefer cheaper models and BitNet when budget is tight
-- Reduce concurrency to slow spend rate if needed
-
-## Task Decomposition
-
-- Break tasks to smallest sensible size
-- Small enough for the model tier, large enough for code coherence
-- Tasks that are inherently interconnected should stay as single tasks
-- Every task references SRS requirements (FR-xxx, AC-xxx)
-- Test tasks are SEPARATE from implementation, using a DIFFERENT model family
-
-## Communication Model
-
-Strictly hierarchical: you communicate only with the engine.
-Meeseeks do not communicate with each other unless you explicitly
-request lateral channels via the engine.
-
-## ECO Process
-
-Valid categories: ECO-DEP (dependency), ECO-API (API change), ECO-SEC (security),
-ECO-PLT (platform), ECO-LIC (license), ECO-PRV (provider limitation).
-ECOs are for environmental changes ONLY, not scope changes.
-
-## Error Handling
-
-- Failed tasks retry up to 3 times at the same tier
-- After retry exhaustion: escalate to next tier (max 2 escalations)
-- After escalation exhaustion: task is BLOCKED, requires restructuring
-- You may restructure blocked tasks, provide additional context, or file ECOs
-
-## Test Authorship Separation
-
-Tests MUST be authored by a different Meeseeks from a different model family
-than the implementation. This prevents circular validation.
-Test tasks depend on implementation tasks (created after implementation merges).
-`
-
-var clawTemplate = `# Axiom Skill: Orchestrator Instructions
-
-You are orchestrating an Axiom project as a Claw-based orchestrator.
-You connect to Axiom via the REST API at http://localhost:{{.APIPort}}.
-
-Project: {{.ProjectName}} ({{.ProjectSlug}})
-Docker image: {{.DockerImage}}
-Branch: {{.BranchPrefix}}/{{.ProjectSlug}}
-` + sharedContent
-
-var claudeCodeTemplate = `# Axiom Orchestrator Instructions for Claude Code
-
-You are orchestrating an Axiom project as an embedded Claude Code orchestrator.
-All inference goes through the engine's Inference Broker via IPC.
-
-Project: {{.ProjectName}} ({{.ProjectSlug}})
-Docker image: {{.DockerImage}}
-Branch: {{.BranchPrefix}}/{{.ProjectSlug}}
-
-IMPORTANT: Do NOT execute code directly. Submit all actions through IPC.
-Do NOT write files to the project filesystem. Propose file writes through
-the engine's approval pipeline.
-` + sharedContent
-
-var codexTemplate = `# Axiom Orchestrator Instructions for Codex
-
-You are orchestrating an Axiom project as an embedded Codex orchestrator.
-All inference goes through the engine's Inference Broker via IPC.
-
-Project: {{.ProjectName}} ({{.ProjectSlug}})
-Docker image: {{.DockerImage}}
-Branch: {{.BranchPrefix}}/{{.ProjectSlug}}
-` + sharedContent
-
-var openCodeTemplate = `# Axiom Orchestrator Instructions for OpenCode
-
-You are orchestrating an Axiom project as an embedded OpenCode orchestrator.
-All inference goes through the engine's Inference Broker via IPC.
-
-Project: {{.ProjectName}} ({{.ProjectSlug}})
-Docker image: {{.DockerImage}}
-Branch: {{.BranchPrefix}}/{{.ProjectSlug}}
-` + sharedContent
-
 // ContentTopics returns the 13 required content items for verification.
 func ContentTopics() []string {
 	return []string{
 		"Axiom Workflow",
 		"Trusted Engine vs. Untrusted Agent Plane",
-		"Available Request Types",
+		"Available",
 		"TaskSpec Format",
 		"ReviewSpec Format",
 		"Context Tiers",
-		"Model Tiers",
+		"Model",
 		"Budget Management",
 		"Task Decomposition",
 		"Communication Model",
-		"ECO Process",
+		"Engineering Change Orders",
 		"Error Handling",
 		"Test Authorship Separation",
 	}

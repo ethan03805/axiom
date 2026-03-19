@@ -7,177 +7,298 @@ import (
 	"testing"
 )
 
-func setupTestGenerator(t *testing.T) (*Generator, string) {
+// testTemplateData returns a TemplateData populated with test values.
+func testTemplateData() TemplateData {
+	return TemplateData{
+		ProjectName:       "test-project",
+		ProjectSlug:       "test-project",
+		BudgetUSD:         25.00,
+		BudgetMax:         "25.00",
+		MaxMeeseeks:       8,
+		APIPort:           3000,
+		BitNetEnabled:     true,
+		BitNetPort:        3002,
+		DockerImage:       "axiom-meeseeks-multi:latest",
+		BranchPrefix:      "axiom",
+		ModelTiers:        "Standard model tiers configured.",
+		ModelTiersSummary: "Standard model tiers configured.",
+		IPCEndpoint:       "filesystem IPC at /workspace/ipc/",
+	}
+}
+
+// findRepoRoot walks upward from the current working directory to find the
+// repository root (identified by the presence of a skills/ directory).
+func findRepoRoot(t *testing.T) string {
 	t.Helper()
-	tmpDir, err := os.MkdirTemp("", "axiom-skill-test-*")
+	dir, err := os.Getwd()
 	if err != nil {
-		t.Fatalf("create temp dir: %v", err)
+		t.Fatalf("getwd: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(tmpDir) })
-
-	return NewGenerator(tmpDir), tmpDir
-}
-
-func testData() *TemplateData {
-	return &TemplateData{
-		ProjectName:  "My Project",
-		ProjectSlug:  "my-project",
-		BudgetUSD:    10.0,
-		MaxMeeseeks:  10,
-		APIPort:      3000,
-		BitNetEnabled: true,
-		BitNetPort:   3002,
-		DockerImage:  "axiom-meeseeks-multi:latest",
-		BranchPrefix: "axiom",
-		ModelTiers:   "local, cheap, standard, premium",
-	}
-}
-
-func TestGenerateAllRuntimes(t *testing.T) {
-	gen, tmpDir := setupTestGenerator(t)
-
-	for _, rt := range SupportedRuntimes() {
-		path, err := gen.Generate(rt, testData())
-		if err != nil {
-			t.Fatalf("generate %s: %v", rt, err)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "skills")); err == nil {
+			return dir
 		}
-
-		// Verify file was created.
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			t.Errorf("%s: output file not created at %s", rt, path)
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("could not find repository root (no skills/ directory found)")
 		}
-
-		// Verify output path matches expected.
-		expectedPath := filepath.Join(tmpDir, OutputPaths[rt])
-		if path != expectedPath {
-			t.Errorf("%s: path = %s, want %s", rt, path, expectedPath)
-		}
-	}
-}
-
-func TestGenerateContainsAll13Topics(t *testing.T) {
-	gen, _ := setupTestGenerator(t)
-
-	for _, rt := range SupportedRuntimes() {
-		path, err := gen.Generate(rt, testData())
-		if err != nil {
-			t.Fatalf("generate %s: %v", rt, err)
-		}
-
-		content, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("read %s: %v", rt, err)
-		}
-
-		missing := VerifyContent(string(content))
-		if len(missing) > 0 {
-			t.Errorf("%s: missing required topics: %v", rt, missing)
-		}
-	}
-}
-
-func TestGenerateClawContainsAPIPort(t *testing.T) {
-	gen, _ := setupTestGenerator(t)
-
-	path, _ := gen.Generate(RuntimeClaw, testData())
-	content, _ := os.ReadFile(path)
-
-	if !strings.Contains(string(content), "3000") {
-		t.Error("Claw skill should contain API port")
-	}
-	if !strings.Contains(string(content), "REST API") {
-		t.Error("Claw skill should reference REST API")
-	}
-}
-
-func TestGenerateClaudeCodeContainsWarning(t *testing.T) {
-	gen, _ := setupTestGenerator(t)
-
-	path, _ := gen.Generate(RuntimeClaudeCode, testData())
-	content, _ := os.ReadFile(path)
-
-	if !strings.Contains(string(content), "Do NOT execute code directly") {
-		t.Error("Claude Code skill should contain execution warning")
-	}
-}
-
-func TestGenerateInjectsDynamicContent(t *testing.T) {
-	gen, _ := setupTestGenerator(t)
-
-	data := testData()
-	data.ProjectName = "Super API"
-	data.BudgetUSD = 25.50
-
-	path, _ := gen.Generate(RuntimeClaw, data)
-	content, _ := os.ReadFile(path)
-
-	if !strings.Contains(string(content), "Super API") {
-		t.Error("should contain project name")
-	}
-	if !strings.Contains(string(content), "25.50") {
-		t.Error("should contain budget amount")
-	}
-}
-
-func TestGenerateUnsupportedRuntime(t *testing.T) {
-	gen, _ := setupTestGenerator(t)
-
-	_, err := gen.Generate("invalid-runtime", testData())
-	if err == nil {
-		t.Error("expected error for unsupported runtime")
+		dir = parent
 	}
 }
 
 func TestIsValidRuntime(t *testing.T) {
-	valid := []string{"claw", "claude-code", "codex", "opencode"}
-	for _, rt := range valid {
-		if !IsValidRuntime(rt) {
-			t.Errorf("%s should be valid", rt)
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"claw", true},
+		{"claude-code", true},
+		{"codex", true},
+		{"opencode", true},
+		{"invalid", false},
+		{"", false},
+		{"CLAW", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := IsValidRuntime(tt.input)
+			if got != tt.want {
+				t.Errorf("IsValidRuntime(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSupportedRuntimes(t *testing.T) {
+	rts := SupportedRuntimes()
+	if len(rts) != 4 {
+		t.Fatalf("expected 4 supported runtimes, got %d", len(rts))
+	}
+
+	expected := map[Runtime]bool{
+		RuntimeClaw: true, RuntimeClaudeCode: true,
+		RuntimeCodex: true, RuntimeOpenCode: true,
+	}
+	for _, rt := range rts {
+		if !expected[rt] {
+			t.Errorf("unexpected runtime: %s", rt)
 		}
 	}
-	invalid := []string{"invalid", "cursor", "", "CLAW"}
-	for _, rt := range invalid {
-		if IsValidRuntime(rt) {
-			t.Errorf("%s should be invalid", rt)
+}
+
+func TestLoadTemplatesFromDir(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	gen := NewGenerator(repoRoot)
+
+	if err := gen.LoadTemplates(); err != nil {
+		t.Fatalf("LoadTemplates() error: %v", err)
+	}
+
+	if !gen.HasTemplates() {
+		t.Fatal("HasTemplates() returned false after loading")
+	}
+
+	// Verify all four runtimes have templates.
+	for _, rt := range SupportedRuntimes() {
+		if _, ok := gen.templates[rt]; !ok {
+			t.Errorf("missing template for runtime %s", rt)
 		}
 	}
 }
 
-func TestContentTopicsCount(t *testing.T) {
-	topics := ContentTopics()
-	if len(topics) != 13 {
-		t.Errorf("expected 13 topics, got %d", len(topics))
+func TestLoadTemplates_MissingDir(t *testing.T) {
+	gen := NewGenerator("/nonexistent/path")
+	err := gen.LoadTemplates()
+	if err == nil {
+		t.Fatal("expected error for missing skills directory")
+	}
+	if !strings.Contains(err.Error(), "skills directory not found") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
 
-func TestVerifyContentDetectsMissing(t *testing.T) {
-	// Incomplete content missing some topics.
-	content := "## Axiom Workflow\n## Budget Management\n"
-	missing := VerifyContent(content)
-	if len(missing) != 11 { // 13 - 2 present = 11 missing
-		t.Errorf("expected 11 missing topics, got %d", len(missing))
+func TestGenerate_AllRuntimes(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	gen := NewGenerator(repoRoot)
+	if err := gen.LoadTemplates(); err != nil {
+		t.Fatalf("LoadTemplates: %v", err)
+	}
+
+	data := testTemplateData()
+
+	for _, rt := range SupportedRuntimes() {
+		t.Run(string(rt), func(t *testing.T) {
+			content, err := gen.Generate(rt, data)
+			if err != nil {
+				t.Fatalf("Generate(%s) error: %v", rt, err)
+			}
+			if content == "" {
+				t.Fatal("Generate returned empty content")
+			}
+
+			// Check that project-specific data was injected.
+			if !strings.Contains(content, "test-project") {
+				t.Error("rendered content does not contain project name")
+			}
+			if !strings.Contains(content, "axiom-meeseeks-multi:latest") {
+				t.Error("rendered content does not contain docker image")
+			}
+
+			// Verify the 13 required content sections are present.
+			missing := VerifyContent(content)
+			if len(missing) > 0 {
+				t.Errorf("missing content topics: %v", missing)
+			}
+		})
 	}
 }
 
-func TestOutputPathsComplete(t *testing.T) {
+func TestGenerate_UnsupportedRuntime(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	gen := NewGenerator(repoRoot)
+	if err := gen.LoadTemplates(); err != nil {
+		t.Fatalf("LoadTemplates: %v", err)
+	}
+
+	_, err := gen.Generate(Runtime("invalid"), testTemplateData())
+	if err == nil {
+		t.Fatal("expected error for unsupported runtime")
+	}
+	if !strings.Contains(err.Error(), "no template loaded") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestGenerate_BudgetMaxAutoPopulated(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	gen := NewGenerator(repoRoot)
+	if err := gen.LoadTemplates(); err != nil {
+		t.Fatalf("LoadTemplates: %v", err)
+	}
+
+	data := testTemplateData()
+	data.BudgetMax = "" // Leave empty -- should be auto-populated from BudgetUSD.
+
+	content, err := gen.Generate(RuntimeClaw, data)
+	if err != nil {
+		t.Fatalf("Generate error: %v", err)
+	}
+	if !strings.Contains(content, "25.00") {
+		t.Error("auto-populated BudgetMax not found in rendered output")
+	}
+}
+
+func TestWriteSkillFile_AllRuntimes(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	gen := NewGenerator(repoRoot)
+	if err := gen.LoadTemplates(); err != nil {
+		t.Fatalf("LoadTemplates: %v", err)
+	}
+
+	data := testTemplateData()
+
+	// Write to a temporary directory.
+	tmpDir := t.TempDir()
+
+	for _, rt := range SupportedRuntimes() {
+		t.Run(string(rt), func(t *testing.T) {
+			outputPath, err := gen.WriteSkillFile(rt, data, tmpDir)
+			if err != nil {
+				t.Fatalf("WriteSkillFile(%s) error: %v", rt, err)
+			}
+
+			// Verify the output path matches expected.
+			expectedRel := OutputPaths[rt]
+			expectedFull := filepath.Join(tmpDir, expectedRel)
+			if outputPath != expectedFull {
+				t.Errorf("output path = %q, want %q", outputPath, expectedFull)
+			}
+
+			// Verify the file exists and has content.
+			info, err := os.Stat(outputPath)
+			if err != nil {
+				t.Fatalf("stat output file: %v", err)
+			}
+			if info.Size() == 0 {
+				t.Error("output file is empty")
+			}
+
+			// Read and verify content.
+			content, err := os.ReadFile(outputPath)
+			if err != nil {
+				t.Fatalf("read output file: %v", err)
+			}
+			if !strings.Contains(string(content), "test-project") {
+				t.Error("output file does not contain project name")
+			}
+		})
+	}
+}
+
+func TestWriteSkillFile_CreatesSubdirectories(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	gen := NewGenerator(repoRoot)
+	if err := gen.LoadTemplates(); err != nil {
+		t.Fatalf("LoadTemplates: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	data := testTemplateData()
+
+	// Claude Code output goes to .claude/CLAUDE.md -- verify the directory is created.
+	outputPath, err := gen.WriteSkillFile(RuntimeClaudeCode, data, tmpDir)
+	if err != nil {
+		t.Fatalf("WriteSkillFile error: %v", err)
+	}
+
+	expectedDir := filepath.Join(tmpDir, ".claude")
+	info, err := os.Stat(expectedDir)
+	if err != nil {
+		t.Fatalf(".claude directory was not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Error(".claude is not a directory")
+	}
+
+	if !strings.HasSuffix(outputPath, ".claude/CLAUDE.md") {
+		t.Errorf("unexpected output path: %s", outputPath)
+	}
+}
+
+func TestOutputPaths(t *testing.T) {
+	// Verify all runtimes have output paths defined.
 	for _, rt := range SupportedRuntimes() {
 		if _, ok := OutputPaths[rt]; !ok {
-			t.Errorf("missing output path for %s", rt)
+			t.Errorf("no output path for runtime %s", rt)
+		}
+	}
+
+	// Verify specific paths per Architecture Section 25.2.
+	checks := map[Runtime]string{
+		RuntimeClaw:       "axiom-skill.md",
+		RuntimeClaudeCode: ".claude/CLAUDE.md",
+		RuntimeCodex:      "codex-instructions.md",
+		RuntimeOpenCode:   "opencode-instructions.md",
+	}
+	for rt, want := range checks {
+		got := OutputPaths[rt]
+		if got != want {
+			t.Errorf("OutputPaths[%s] = %q, want %q", rt, got, want)
 		}
 	}
 }
 
-func TestGenerateCreatesParentDirs(t *testing.T) {
-	gen, tmpDir := setupTestGenerator(t)
-
-	// Claude Code outputs to .claude/CLAUDE.md which needs a subdirectory.
-	_, err := gen.Generate(RuntimeClaudeCode, testData())
-	if err != nil {
-		t.Fatalf("generate: %v", err)
+func TestVerifyContent(t *testing.T) {
+	// A string with all topics should return no missing items.
+	full := strings.Join(ContentTopics(), "\n")
+	missing := VerifyContent(full)
+	if len(missing) != 0 {
+		t.Errorf("expected no missing topics, got %v", missing)
 	}
 
-	claudeDir := filepath.Join(tmpDir, ".claude")
-	if _, err := os.Stat(claudeDir); os.IsNotExist(err) {
-		t.Error(".claude directory should be created")
+	// An empty string should report all topics missing.
+	missing = VerifyContent("")
+	if len(missing) != len(ContentTopics()) {
+		t.Errorf("expected %d missing topics, got %d", len(ContentTopics()), len(missing))
 	}
 }

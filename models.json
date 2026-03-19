@@ -1,0 +1,83 @@
+{
+  "description": "Curated model capability index for Axiom. Merged with OpenRouter API data during `axiom models refresh`. See Architecture Section 18.4.",
+  "version": "1.0",
+  "models": [
+    {
+      "id": "anthropic/claude-sonnet-4",
+      "strengths": ["code-generation", "reasoning", "refactoring", "debugging", "multi-file-changes"],
+      "weaknesses": ["slow-for-trivial-tasks", "expensive-for-boilerplate"],
+      "recommended_for": ["standard-coding", "code-review", "moderate-refactoring", "api-construction"],
+      "not_recommended_for": ["simple-renames", "config-changes", "import-additions"]
+    },
+    {
+      "id": "anthropic/claude-opus-4",
+      "strengths": ["complex-algorithms", "architectural-patterns", "coherent-api-construction", "critical-path-code", "deep-reasoning"],
+      "weaknesses": ["expensive", "slow-for-simple-tasks", "overkill-for-boilerplate"],
+      "recommended_for": ["premium-coding", "complex-refactoring", "architecture-design", "security-critical-code"],
+      "not_recommended_for": ["simple-implementations", "config-changes", "formatting"]
+    },
+    {
+      "id": "anthropic/claude-haiku-4",
+      "strengths": ["fast", "cheap", "simple-functions", "straightforward-implementations"],
+      "weaknesses": ["limited-reasoning", "struggles-with-complex-logic", "poor-architectural-decisions"],
+      "recommended_for": ["simple-functions", "small-modifications", "test-stubs", "boilerplate"],
+      "not_recommended_for": ["complex-algorithms", "multi-file-refactoring", "architecture"]
+    },
+    {
+      "id": "openai/gpt-4o",
+      "strengths": ["code-generation", "reasoning", "tool-use", "multi-modal"],
+      "weaknesses": ["verbose-output", "sometimes-over-engineers"],
+      "recommended_for": ["standard-coding", "code-review", "documentation", "api-design"],
+      "not_recommended_for": ["trivial-tasks", "simple-renames"]
+    },
+    {
+      "id": "openai/o1",
+      "strengths": ["deep-reasoning", "complex-algorithms", "mathematical-proofs", "chain-of-thought"],
+      "weaknesses": ["very-expensive", "slow", "verbose-reasoning"],
+      "recommended_for": ["premium-coding", "algorithm-design", "complex-debugging", "security-analysis"],
+      "not_recommended_for": ["simple-tasks", "boilerplate", "formatting"]
+    },
+    {
+      "id": "openai/gpt-4o-mini",
+      "strengths": ["fast", "cheap", "adequate-for-simple-tasks"],
+      "weaknesses": ["limited-context", "struggles-with-complexity"],
+      "recommended_for": ["simple-functions", "test-generation", "documentation"],
+      "not_recommended_for": ["complex-algorithms", "architecture", "security-critical"]
+    },
+    {
+      "id": "google/gemini-2.5-pro",
+      "strengths": ["large-context", "code-generation", "multi-modal", "long-document-analysis"],
+      "weaknesses": ["inconsistent-quality", "sometimes-hallucinates-apis"],
+      "recommended_for": ["standard-coding", "large-file-analysis", "documentation"],
+      "not_recommended_for": ["security-critical", "precise-algorithm-implementation"]
+    },
+    {
+      "id": "google/gemini-2.5-flash",
+      "strengths": ["fast", "cheap", "adequate-for-simple-tasks", "large-context"],
+      "weaknesses": ["limited-reasoning", "inconsistent-code-quality"],
+      "recommended_for": ["simple-implementations", "boilerplate", "formatting"],
+      "not_recommended_for": ["complex-algorithms", "architecture", "security-critical"]
+    },
+    {
+      "id": "meta-llama/llama-3.3-70b-instruct",
+      "strengths": ["open-source", "good-code-generation", "fast-inference"],
+      "weaknesses": ["limited-context", "weaker-reasoning-than-commercial"],
+      "recommended_for": ["standard-coding", "open-source-projects", "cost-sensitive-tasks"],
+      "not_recommended_for": ["premium-complexity", "security-critical"]
+    },
+    {
+      "id": "deepseek/deepseek-r1",
+      "strengths": ["reasoning", "code-generation", "mathematical-thinking", "cost-effective"],
+      "weaknesses": ["slower-than-non-reasoning-models", "verbose-chain-of-thought"],
+      "recommended_for": ["algorithm-design", "debugging", "complex-logic"],
+      "not_recommended_for": ["simple-tasks", "boilerplate", "time-sensitive"]
+    },
+    {
+      "id": "local/falcon3-1b",
+      "strengths": ["zero-cost", "zero-latency", "runs-locally", "grammar-constrained"],
+      "weaknesses": ["very-limited-capability", "only-trivial-tasks", "requires-grammar-constraints"],
+      "recommended_for": ["variable-renames", "import-additions", "config-changes", "boilerplate", "file-moves", "simple-formatting"],
+      "not_recommended_for": ["any-non-trivial-coding", "reasoning", "multi-file-changes", "algorithm-implementation"]
+    }
+  ]
+}

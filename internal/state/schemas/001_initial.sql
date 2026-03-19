@@ -10,6 +10,7 @@ CREATE TABLE tasks (
     task_type       TEXT NOT NULL DEFAULT 'implementation',
     base_snapshot   TEXT,
     eco_ref         TEXT REFERENCES eco_log(id),
+    blocked_by_task_id TEXT REFERENCES tasks(id),
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
     completed_at    DATETIME
 );

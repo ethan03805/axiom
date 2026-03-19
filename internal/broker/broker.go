@@ -82,6 +82,7 @@ type InferenceRequest struct {
 	MaxTokens          int
 	Temperature        float64
 	GrammarConstraints *string // GBNF grammar for BitNet, nil otherwise
+	AgentType          string  // "meeseeks" | "reviewer" | "sub_orchestrator" | "orchestrator"
 }
 
 // ChatMessage represents a single message in a chat completion request.
@@ -104,6 +105,7 @@ type InferenceResponse struct {
 type Config struct {
 	BudgetMaxUSD  float64 // Project budget ceiling
 	MaxReqPerTask int     // Max inference requests per task (default 50)
+	IPCBaseDir    string  // Base directory for IPC (e.g. ".axiom/containers/ipc")
 }
 
 // Broker mediates all model API calls. Containers submit inference requests
@@ -381,9 +383,14 @@ func (b *Broker) logCost(req *InferenceRequest, resp *InferenceResponse) {
 			float64(resp.OutputTokens)*modelInfo.Pricing.CompletionPerMillion/1_000_000
 	}
 
+	agentType := req.AgentType
+	if agentType == "" {
+		agentType = "meeseeks" // default for backward compatibility
+	}
+
 	_ = b.db.InsertCost(&state.CostEntry{
 		TaskID:       req.TaskID,
-		AgentType:    "meeseeks",
+		AgentType:    agentType,
 		ModelID:      req.ModelID,
 		InputTokens:  resp.InputTokens,
 		OutputTokens: resp.OutputTokens,
@@ -393,11 +400,14 @@ func (b *Broker) logCost(req *InferenceRequest, resp *InferenceResponse) {
 }
 
 // ipcWriterBaseDir returns the base IPC directory for the StreamWriter.
-// This is derived from the Writer's configuration.
+// Uses the IPCBaseDir from the broker config. Falls back to the IPC writer's
+// base directory if no explicit config value is set.
 func (b *Broker) ipcWriterBaseDir() string {
-	// The IPC writer base dir is .axiom/containers/ipc
-	// This is a simplified accessor; in production the path comes from config.
-	return ".axiom/containers/ipc"
+	if b.config.IPCBaseDir != "" {
+		return b.config.IPCBaseDir
+	}
+	// Fallback: derive from the IPC writer's base directory.
+	return b.ipcWriter.BaseDir()
 }
 
 // ResetTaskCount resets the rate limit counter for a task.

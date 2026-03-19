@@ -21,6 +21,11 @@ type Writer struct {
 	seqNums map[string]int // taskID -> next sequence number
 }
 
+// BaseDir returns the base IPC directory path for this Writer.
+func (w *Writer) BaseDir() string {
+	return w.baseDir
+}
+
 // NewWriter creates a Writer rooted at the given base IPC directory.
 // The baseDir should be the path to .axiom/containers/ipc/.
 func NewWriter(baseDir string) *Writer {

@@ -95,16 +95,16 @@ func (db *DB) CreateTaskBatch(tasks []*Task) error {
 // GetTask retrieves a task by ID.
 func (db *DB) GetTask(id string) (*Task, error) {
 	row := db.conn.QueryRow(
-		`SELECT id, parent_id, title, description, status, tier, task_type, base_snapshot, eco_ref, created_at, completed_at
+		`SELECT id, parent_id, title, description, status, tier, task_type, base_snapshot, eco_ref, blocked_by_task_id, created_at, completed_at
 		 FROM tasks WHERE id = ?`, id,
 	)
 
 	task := &Task{}
-	var parentID, ecoRef sql.NullString
+	var parentID, ecoRef, blockedByTaskID sql.NullString
 	err := row.Scan(
 		&task.ID, &parentID, &task.Title, &task.Description,
 		&task.Status, &task.Tier, &task.TaskType, &task.BaseSnapshot,
-		&ecoRef, &task.CreatedAt, &task.CompletedAt,
+		&ecoRef, &blockedByTaskID, &task.CreatedAt, &task.CompletedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("task not found: %s", id)
@@ -114,12 +114,13 @@ func (db *DB) GetTask(id string) (*Task, error) {
 	}
 	task.ParentID = parentID.String
 	task.EcoRef = ecoRef.String
+	task.BlockedByTaskID = blockedByTaskID.String
 	return task, nil
 }
 
 // ListTasks returns tasks matching the given filter criteria.
 func (db *DB) ListTasks(filter TaskFilter) ([]*Task, error) {
-	query := `SELECT id, parent_id, title, description, status, tier, task_type, base_snapshot, eco_ref, created_at, completed_at FROM tasks WHERE 1=1`
+	query := `SELECT id, parent_id, title, description, status, tier, task_type, base_snapshot, eco_ref, blocked_by_task_id, created_at, completed_at FROM tasks WHERE 1=1`
 	var args []interface{}
 
 	if filter.Status != "" {
@@ -146,17 +147,18 @@ func (db *DB) ListTasks(filter TaskFilter) ([]*Task, error) {
 	var tasks []*Task
 	for rows.Next() {
 		task := &Task{}
-		var parentID, ecoRef sql.NullString
+		var parentID, ecoRef, blockedByTaskID sql.NullString
 		err := rows.Scan(
 			&task.ID, &parentID, &task.Title, &task.Description,
 			&task.Status, &task.Tier, &task.TaskType, &task.BaseSnapshot,
-			&ecoRef, &task.CreatedAt, &task.CompletedAt,
+			&ecoRef, &blockedByTaskID, &task.CreatedAt, &task.CompletedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan task: %w", err)
 		}
 		task.ParentID = parentID.String
 		task.EcoRef = ecoRef.String
+		task.BlockedByTaskID = blockedByTaskID.String
 		tasks = append(tasks, task)
 	}
 	return tasks, rows.Err()
@@ -199,10 +201,12 @@ func (db *DB) UpdateTaskStatus(id string, status TaskStatus) error {
 		}
 	}
 
-	// Update status (and completed_at if done)
+	// Update status (and completed_at if done, clear blocked_by_task_id when leaving waiting_on_lock)
 	if status == TaskStatusDone {
 		now := time.Now()
 		_, err = db.conn.Exec("UPDATE tasks SET status = ?, completed_at = ? WHERE id = ?", string(status), now, id)
+	} else if current == TaskStatusWaitingOnLock {
+		_, err = db.conn.Exec("UPDATE tasks SET status = ?, blocked_by_task_id = NULL WHERE id = ?", string(status), id)
 	} else {
 		_, err = db.conn.Exec("UPDATE tasks SET status = ? WHERE id = ?", string(status), id)
 	}
@@ -216,7 +220,8 @@ func (db *DB) UpdateTaskStatus(id string, status TaskStatus) error {
 func (db *DB) GetReadyTasks() ([]*Task, error) {
 	rows, err := db.conn.Query(`
 		SELECT t.id, t.parent_id, t.title, t.description, t.status, t.tier,
-		       t.task_type, t.base_snapshot, t.eco_ref, t.created_at, t.completed_at
+		       t.task_type, t.base_snapshot, t.eco_ref, t.blocked_by_task_id,
+		       t.created_at, t.completed_at
 		FROM tasks t
 		WHERE t.status = 'queued'
 		  AND NOT EXISTS (
@@ -234,17 +239,18 @@ func (db *DB) GetReadyTasks() ([]*Task, error) {
 	var tasks []*Task
 	for rows.Next() {
 		task := &Task{}
-		var parentID, ecoRef sql.NullString
+		var parentID, ecoRef, blockedByTaskID sql.NullString
 		err := rows.Scan(
 			&task.ID, &parentID, &task.Title, &task.Description,
 			&task.Status, &task.Tier, &task.TaskType, &task.BaseSnapshot,
-			&ecoRef, &task.CreatedAt, &task.CompletedAt,
+			&ecoRef, &blockedByTaskID, &task.CreatedAt, &task.CompletedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan task: %w", err)
 		}
 		task.ParentID = parentID.String
 		task.EcoRef = ecoRef.String
+		task.BlockedByTaskID = blockedByTaskID.String
 		tasks = append(tasks, task)
 	}
 	return tasks, rows.Err()
@@ -416,17 +422,14 @@ func (db *DB) GetTaskDependencies(taskID string) ([]string, error) {
 // blocked by the given task ID. Used to re-queue tasks when locks are released.
 // See Architecture Section 10.7 (Lock Conflict During Scope Expansion).
 func (db *DB) GetWaitingOnLockTasks(blockedByTaskID string) ([]*Task, error) {
-	// waiting_on_lock tasks record the blocking task in the description field
-	// as "blocked_by:<task-id>". This is a simple approach that avoids adding
-	// another column; a production system might use a dedicated column.
 	rows, err := db.conn.Query(`
 		SELECT id, parent_id, title, description, status, tier, task_type,
-		       base_snapshot, eco_ref, created_at, completed_at
+		       base_snapshot, eco_ref, blocked_by_task_id, created_at, completed_at
 		FROM tasks
 		WHERE status = 'waiting_on_lock'
-		  AND description LIKE ?
+		  AND blocked_by_task_id = ?
 		ORDER BY created_at`,
-		"blocked_by:"+blockedByTaskID+"%",
+		blockedByTaskID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("get waiting on lock tasks: %w", err)
@@ -436,32 +439,32 @@ func (db *DB) GetWaitingOnLockTasks(blockedByTaskID string) ([]*Task, error) {
 	var tasks []*Task
 	for rows.Next() {
 		task := &Task{}
-		var parentID, ecoRef sql.NullString
+		var parentID, ecoRef, blockedBy sql.NullString
 		err := rows.Scan(
 			&task.ID, &parentID, &task.Title, &task.Description,
 			&task.Status, &task.Tier, &task.TaskType, &task.BaseSnapshot,
-			&ecoRef, &task.CreatedAt, &task.CompletedAt,
+			&ecoRef, &blockedBy, &task.CreatedAt, &task.CompletedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan task: %w", err)
 		}
 		task.ParentID = parentID.String
 		task.EcoRef = ecoRef.String
+		task.BlockedByTaskID = blockedBy.String
 		tasks = append(tasks, task)
 	}
 	return tasks, rows.Err()
 }
 
 // SetTaskWaitingOnLock transitions a task to waiting_on_lock and records
-// the blocking task and requested expansion files in the description.
+// the blocking task ID in the dedicated blocked_by_task_id column.
 func (db *DB) SetTaskWaitingOnLock(taskID, blockedByTaskID string, expandedFiles []string) error {
 	if err := db.UpdateTaskStatus(taskID, TaskStatusWaitingOnLock); err != nil {
 		return err
 	}
-	desc := fmt.Sprintf("blocked_by:%s files:%v", blockedByTaskID, expandedFiles)
-	_, err := db.conn.Exec("UPDATE tasks SET description = ? WHERE id = ?", desc, taskID)
+	_, err := db.conn.Exec("UPDATE tasks SET blocked_by_task_id = ? WHERE id = ?", blockedByTaskID, taskID)
 	if err != nil {
-		return fmt.Errorf("update waiting description: %w", err)
+		return fmt.Errorf("update blocked_by_task_id: %w", err)
 	}
 	return nil
 }

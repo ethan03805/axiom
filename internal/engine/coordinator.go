@@ -179,6 +179,7 @@ func NewCoordinator(config *Config, projectRoot string) (*Coordinator, error) {
 		broker.Config{
 			BudgetMaxUSD:  config.Budget.MaxUSD,
 			MaxReqPerTask: 50,
+			IPCBaseDir:    ipcBaseDir,
 		},
 	)
 
@@ -778,6 +779,50 @@ func (c *Coordinator) GitManager() *git.Manager { return c.gitMgr }
 
 // IPCWriter returns the IPC writer.
 func (c *Coordinator) IPCWriter() *ipc.Writer { return c.ipcWriter }
+
+// ApproveSRS approves the SRS document. Delegates to the SRS approval manager.
+// This method satisfies the api.CoordinatorAPI interface.
+func (c *Coordinator) ApproveSRS(approvedBy string) (string, error) {
+	return c.srsApproval.Approve(approvedBy)
+}
+
+// RejectSRS rejects the SRS document with feedback. Delegates to the SRS approval manager.
+// This method satisfies the api.CoordinatorAPI interface.
+func (c *Coordinator) RejectSRS(feedback string) error {
+	return c.srsApproval.Reject(feedback)
+}
+
+// ApproveECO approves an Engineering Change Order. Delegates to the ECO manager.
+// This method satisfies the api.CoordinatorAPI interface.
+func (c *Coordinator) ApproveECO(ecoID int64, approvedBy string) error {
+	return c.ecoMgr.ApproveECO(ecoID, approvedBy)
+}
+
+// RejectECO rejects an Engineering Change Order. Delegates to the ECO manager.
+// This method satisfies the api.CoordinatorAPI interface.
+func (c *Coordinator) RejectECO(ecoID int64, rejectedBy string) error {
+	return c.ecoMgr.RejectECO(ecoID, rejectedBy)
+}
+
+// IsPaused returns whether the coordinator is currently paused.
+// This method satisfies the api.CoordinatorAPI interface.
+func (c *Coordinator) IsPaused() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.paused
+}
+
+// CompletionPercentage calculates the percentage of tasks that are done.
+// This is the public accessor that satisfies the api.CoordinatorAPI interface.
+func (c *Coordinator) CompletionPercentage() float64 {
+	return c.completionPercentage()
+}
+
+// ActiveContainerCount returns the number of active agent containers.
+// This is the public accessor that satisfies the api.CoordinatorAPI interface.
+func (c *Coordinator) ActiveContainerCount() int {
+	return c.activeContainerCount()
+}
 
 // activeContainerCount returns the number of active agent containers.
 func (c *Coordinator) activeContainerCount() int {

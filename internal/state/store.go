@@ -6,17 +6,18 @@ import (
 
 // Task represents a unit of work in the system.
 type Task struct {
-	ID           string
-	ParentID     string
-	Title        string
-	Description  string
-	Status       string
-	Tier         string
-	TaskType     string
-	BaseSnapshot string
-	EcoRef       string
-	CreatedAt    time.Time
-	CompletedAt  *time.Time
+	ID              string
+	ParentID        string
+	Title           string
+	Description     string
+	Status          string
+	Tier            string
+	TaskType        string
+	BaseSnapshot    string
+	EcoRef          string
+	BlockedByTaskID string
+	CreatedAt       time.Time
+	CompletedAt     *time.Time
 }
 
 // TaskAttempt represents a single execution attempt of a task.
