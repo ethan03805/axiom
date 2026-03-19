@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/ethan03805/axiom/internal/engine"
 	"github.com/ethan03805/axiom/internal/registry"
 	"github.com/spf13/cobra"
 )
@@ -47,8 +48,15 @@ See Architecture Section 18.4.`,
 		}
 		defer reg.Close()
 
-		// Fetch from OpenRouter.
-		apiKey := os.Getenv("OPENROUTER_API_KEY")
+		// Load API key from config first, fall back to env var.
+		// Architecture Section 19.5: API keys stored in ~/.axiom/config.toml.
+		apiKey := ""
+		if globalCfg, err := engine.LoadConfig(); err == nil && globalCfg.OpenRouter.APIKey != "" {
+			apiKey = globalCfg.OpenRouter.APIKey
+		}
+		if envKey := os.Getenv("OPENROUTER_API_KEY"); envKey != "" {
+			apiKey = envKey
+		}
 		fetcher := registry.NewOpenRouterFetcher(apiKey)
 		if fetcher.Available() {
 			fmt.Println("Fetching from OpenRouter API...")
@@ -81,9 +89,10 @@ See Architecture Section 18.4.`,
 		fmt.Println("  Added local/falcon3-1b")
 
 		// Merge curated capability data from models.json.
+		// Look in multiple locations: next to binary, ~/.axiom/, then cwd.
 		fmt.Println("Merging curated capability data...")
-		curatedPath := "models.json"
-		if _, err := os.Stat(curatedPath); err == nil {
+		curatedPath := findCuratedModelsJSON()
+		if curatedPath != "" {
 			data, err := os.ReadFile(curatedPath)
 			if err == nil {
 				var curatedFile struct {
@@ -186,6 +195,36 @@ var modelsInfoCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// findCuratedModelsJSON searches for models.json in multiple locations:
+// 1. Next to the running binary
+// 2. ~/.axiom/models.json
+// 3. Current working directory (fallback)
+// Returns empty string if not found anywhere.
+func findCuratedModelsJSON() string {
+	// 1. Next to the binary.
+	if exe, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(exe), "models.json")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	// 2. Global config directory.
+	if home, err := os.UserHomeDir(); err == nil {
+		candidate := filepath.Join(home, ".axiom", "models.json")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	// 3. Current working directory (fallback).
+	if _, err := os.Stat("models.json"); err == nil {
+		return "models.json"
+	}
+
+	return ""
 }
 
 func init() {

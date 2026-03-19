@@ -21,6 +21,7 @@ type Config struct {
 	Git           GitConfig           `toml:"git"`
 	API           APIConfig           `toml:"api"`
 	Observability ObservabilityConfig `toml:"observability"`
+	OpenRouter    OpenRouterConfig    `toml:"openrouter"`
 }
 
 // ProjectConfig holds project identification settings.
@@ -105,6 +106,11 @@ type APIConfig struct {
 	Port         int      `toml:"port"`
 	RateLimitRPM int      `toml:"rate_limit_rpm"`
 	AllowedIPs   []string `toml:"allowed_ips"`
+}
+
+// OpenRouterConfig holds OpenRouter API settings.
+type OpenRouterConfig struct {
+	APIKey string `toml:"api_key"`
 }
 
 // ObservabilityConfig holds logging and metrics settings.

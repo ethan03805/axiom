@@ -19,6 +19,13 @@ var initCmd = &cobra.Command{
 	Long: `Creates the .axiom/ directory structure with default configuration.
 Sets up the SQLite database, default config.toml, and .gitignore entries.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Warn if no git repository exists, since axiom run requires git.
+		// Architecture Section 28.2: engine refuses to start on a dirty working tree.
+		if _, err := os.Stat(".git"); os.IsNotExist(err) {
+			fmt.Println("Warning: No git repository found in this directory.")
+			fmt.Println("  'axiom run' requires a git repository. Run 'git init' first.")
+		}
+
 		axiomDir := ".axiom"
 
 		// Create directory structure per Architecture Section 28.1.
@@ -350,11 +357,14 @@ var exportCmd = &cobra.Command{
 
 		tasks, _ := coord.DB().ListTasks(state.TaskFilter{})
 		total, _ := coord.DB().GetProjectCost()
+		// Redact sensitive fields before export.
+		exportCfg := *coord.Config()
+		exportCfg.OpenRouter.APIKey = "[REDACTED]"
 		exportData := map[string]interface{}{
 			"version":    Version,
 			"tasks":      tasks,
 			"total_cost": total,
-			"config":     coord.Config(),
+			"config":     exportCfg,
 		}
 		data, err := json.MarshalIndent(exportData, "", "  ")
 		if err != nil {

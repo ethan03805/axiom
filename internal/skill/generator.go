@@ -7,6 +7,7 @@ package skill
 import (
 	"bytes"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -99,6 +100,26 @@ func (g *Generator) LoadTemplatesFromDir(dir string) error {
 		data, err := os.ReadFile(tmplPath)
 		if err != nil {
 			return fmt.Errorf("read template %s: %w", filename, err)
+		}
+
+		tmpl, err := template.New(string(rt)).Parse(string(data))
+		if err != nil {
+			return fmt.Errorf("parse template %s: %w", filename, err)
+		}
+
+		g.templates[rt] = tmpl
+	}
+
+	return nil
+}
+
+// LoadTemplatesFromFS reads template files from an embedded filesystem.
+// This is the preferred method for production use with Go embed.
+func (g *Generator) LoadTemplatesFromFS(fsys fs.FS) error {
+	for rt, filename := range templateFiles {
+		data, err := fs.ReadFile(fsys, filename)
+		if err != nil {
+			return fmt.Errorf("read embedded template %s: %w", filename, err)
 		}
 
 		tmpl, err := template.New(string(rt)).Parse(string(data))
