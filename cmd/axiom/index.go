@@ -1,8 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 
+	"github.com/ethan03805/axiom/internal/index"
+	"github.com/ethan03805/axiom/internal/state"
 	"github.com/spf13/cobra"
 )
 
@@ -16,12 +21,53 @@ var indexCmd = &cobra.Command{
 	},
 }
 
+// openIndexer opens the project SQLite database and creates an Indexer
+// with the Go parser registered. Caller must close the returned state.DB.
+func openIndexer() (*index.Indexer, *state.DB, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, nil, fmt.Errorf("get working directory: %w", err)
+	}
+	dbPath := filepath.Join(cwd, ".axiom", "axiom.db")
+
+	db, err := state.NewDB(dbPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open database: %w", err)
+	}
+
+	idx := index.NewIndexer(db.Conn())
+	if err := idx.InitSchema(); err != nil {
+		db.Close()
+		return nil, nil, fmt.Errorf("init index schema: %w", err)
+	}
+
+	idx.RegisterParser(index.NewGoParser())
+	return idx, db, nil
+}
+
 var indexRefreshCmd = &cobra.Command{
 	Use:   "refresh",
 	Short: "Force full re-index of the project",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("get working directory: %w", err)
+		}
+
+		idx, db, err := openIndexer()
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+
 		fmt.Println("Re-indexing project...")
-		fmt.Println("Index refreshed.")
+		if err := idx.FullIndex(cwd); err != nil {
+			return fmt.Errorf("full index: %w", err)
+		}
+
+		symCount, _ := idx.SymbolCount()
+		fileCount, _ := idx.FileCount()
+		fmt.Printf("Index refreshed: %d symbols across %d files.\n", symCount, fileCount)
 		return nil
 	},
 }
@@ -55,13 +101,38 @@ Query types:
 			return fmt.Errorf("unknown query type: %s", queryType)
 		}
 
-		fmt.Printf("Query: %s\n", queryType)
-		if queryName != "" {
-			fmt.Printf("  Name: %s\n", queryName)
+		idx, db, err := openIndexer()
+		if err != nil {
+			return err
 		}
-		if queryPackage != "" {
-			fmt.Printf("  Package: %s\n", queryPackage)
+		defer db.Close()
+
+		req := &index.QueryRequest{
+			QueryType: index.QueryType(queryType),
+			Params: index.QueryParams{
+				Name:          queryName,
+				SymbolName:    queryName,
+				PackagePath:   queryPackage,
+				InterfaceName: queryName,
+				RootPackage:   queryPackage,
+			},
 		}
+
+		result, err := idx.ExecuteQuery(req)
+		if err != nil {
+			return fmt.Errorf("execute query: %w", err)
+		}
+
+		if len(result.Results) == 0 {
+			fmt.Println("No results found.")
+			return nil
+		}
+
+		data, err := json.MarshalIndent(result.Results, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshal results: %w", err)
+		}
+		fmt.Println(string(data))
 		return nil
 	},
 }
