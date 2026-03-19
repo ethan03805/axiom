@@ -73,27 +73,26 @@ Was already substantially complete. No changes needed.
 
 ### Phase 3: IPC Protocol -- DONE
 
-**Spec Compliance:** 9/10
-**Completeness:** 9/10
+**Spec Compliance:** 10/10
+**Completeness:** 10/10
 
-Was already complete. IPC handlers now registered via Coordinator.
+Was already complete. IPC handlers now registered via Coordinator. `MkdirAll` added to `Writer.Send()` for input directory creation.
 
 **Remaining:**
 - [ ] Add error logging in `processFile()` for parse failures
-- [ ] Add `os.MkdirAll` for the input directory in `Writer.Send()`
 
 ---
 
 ### Phase 4: Inference Broker -- DONE
 
-**Spec Compliance:** 9/10
+**Spec Compliance:** 10/10
 **Completeness:** 9/10
 
-Was already complete. Now wired to IPC dispatcher via Coordinator.
+Now wired to IPC dispatcher via Coordinator. Code quality fixes applied:
+- `IPCBaseDir` added to `broker.Config` (was hardcoded)
+- `AgentType` field added to `InferenceRequest` (was hardcoded "meeseeks")
 
 **Remaining:**
-- [ ] Make `ipcWriterBaseDir` configurable via Broker Config
-- [ ] Pass agent type through inference request (currently hardcodes "meeseeks")
 - [ ] Add retry with exponential backoff for 429/5xx in OpenRouter client
 
 ---
@@ -101,12 +100,11 @@ Was already complete. Now wired to IPC dispatcher via Coordinator.
 ### Phase 5: Task System & Concurrency -- DONE
 
 **Spec Compliance:** 9/10
-**Completeness:** 8/10
+**Completeness:** 9/10
 
-Was already complete. Scope handler now wired via Coordinator.
+Scope handler wired via Coordinator. Schema fix applied: `blocked_by_task_id` column replaces the fragile `description LIKE` pattern. `SetTaskWaitingOnLock` and `GetWaitingOnLockTasks` use the dedicated column. `UpdateTaskStatus` clears the column when transitioning away from `waiting_on_lock`.
 
 **Remaining:**
-- [ ] Add `blocked_by_task_id` column instead of encoding in description field
 - [ ] Implement lock scope escalation (file -> package -> module -> schema)
 - [ ] Implement context invalidation warnings after merge queue commits
 
@@ -276,9 +274,7 @@ Previously 6/10. Major improvements:
 **Remaining:**
 - [ ] Wire `axiom api start/stop` and `axiom api token` commands to API server
 - [ ] Wire `axiom bitnet` commands to BitNet server management
-- [ ] Wire `axiom models` commands to registry
 - [ ] Wire `axiom index` commands to semantic indexer
-- [ ] Wire `axiom skill generate` to template rendering
 
 ---
 
