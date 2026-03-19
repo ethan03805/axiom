@@ -68,7 +68,41 @@ export interface ModelInfo {
   completion_per_million: number;
   strengths: string[];
   weaknesses: string[];
+  supports_tools: boolean;
+  supports_vision: boolean;
+  supports_grammar_constraints: boolean;
+  recommended_for: string[];
+  not_recommended_for: string[];
   historical_success_rate: number | null;
+  avg_cost_per_task: number | null;
+}
+
+/** Resource data returned by the engine for the Resource Monitor view. */
+export interface ResourceData {
+  system_cpus: number;
+  system_memory_gb: number;
+  container_cpu_used: number;
+  container_memory_used_gb: number;
+  containers_active: number;
+  bitnet_running: boolean;
+  bitnet_threads: number;
+  bitnet_active_requests: number;
+  bitnet_memory_gb: number;
+  overloaded: boolean;
+}
+
+/** Container session record matching the Go container_sessions table. */
+export interface ContainerSession {
+  id: string;
+  task_id: string;
+  container_type: string;
+  image: string;
+  model_id: string;
+  cpu_limit: number;
+  mem_limit: string;
+  started_at: string;
+  stopped_at: string | null;
+  exit_reason: string | null;
 }
 
 export interface ProjectStatus {
