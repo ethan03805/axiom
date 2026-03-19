@@ -22,6 +22,7 @@ import (
 	"github.com/ethan03805/axiom/internal/container"
 	"github.com/ethan03805/axiom/internal/events"
 	"github.com/ethan03805/axiom/internal/git"
+	"github.com/ethan03805/axiom/internal/index"
 	"github.com/ethan03805/axiom/internal/ipc"
 	"github.com/ethan03805/axiom/internal/merge"
 	"github.com/ethan03805/axiom/internal/orchestrator"
@@ -60,6 +61,7 @@ type Coordinator struct {
 	budgetEnforce *budget.Enforcer
 	budgetTracker *budget.Tracker
 	secretScanner *security.SecretScanner
+	semanticIdx   *index.Indexer
 	orchestratorMgr *orchestrator.Embedded
 	validationSandbox *container.ValidationSandbox
 	taskSpecBuilder *TaskSpecBuilder
@@ -151,17 +153,15 @@ func NewCoordinator(config *Config, projectRoot string) (*Coordinator, error) {
 	var bitnetProvider broker.Provider
 
 	// OpenRouter client is created if API key is available.
-	// API key is loaded from ~/.axiom/config.toml, never injected into containers.
-	home, _ := os.UserHomeDir()
-	globalCfgPath := filepath.Join(home, ".axiom", "config.toml")
-	if globalCfg, err := LoadConfigFrom(globalCfgPath); err == nil {
-		// Check if there's an API key in the global config.
-		// The API key field is not in the Config struct (by design, it's sensitive).
-		// We'll look for it via TOML directly.
-		_ = globalCfg
+	// API key is loaded from config (global + project merged by LoadConfig()),
+	// with env var as fallback. Never injected into containers.
+	// See Architecture Section 19.5.
+	openrouterAPIKey := config.OpenRouter.APIKey
+	if openrouterAPIKey == "" {
+		openrouterAPIKey = os.Getenv("OPENROUTER_API_KEY")
 	}
 	openrouterProvider = broker.NewOpenRouterClient(broker.OpenRouterConfig{
-		APIKey: os.Getenv("OPENROUTER_API_KEY"), // Fallback to env var
+		APIKey: openrouterAPIKey,
 	})
 
 	if config.BitNet.Enabled {
@@ -219,6 +219,15 @@ func NewCoordinator(config *Config, projectRoot string) (*Coordinator, error) {
 	// See Architecture Section 29.4.
 	c.secretScanner = security.NewSecretScanner(config.Security.SensitivePatterns)
 
+	// Initialize semantic indexer.
+	// See Architecture Section 17.
+	c.semanticIdx = index.NewIndexer(db.Conn())
+	if err := c.semanticIdx.InitSchema(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("init index schema: %w", err)
+	}
+	c.semanticIdx.RegisterParser(index.NewGoParser())
+
 	// Initialize TaskSpec builder.
 	// See Architecture Section 10.3.
 	c.taskSpecBuilder = NewTaskSpecBuilder(db, c.secretScanner, projectRoot)
@@ -228,11 +237,10 @@ func NewCoordinator(config *Config, projectRoot string) (*Coordinator, error) {
 	c.registerIPCHandlers()
 
 	// Wire merge queue callbacks.
-	// After a successful merge, the work queue releases locks and unblocks tasks.
+	// After a successful merge, the semantic indexer incrementally re-indexes
+	// only the changed files. See Architecture Section 17.4.
 	c.mergeQueue.ReindexFn = func(changedFiles []string) error {
-		// Semantic indexer incremental refresh (Phase 8).
-		// Stubbed until tree-sitter integration is complete.
-		return nil
+		return c.semanticIdx.IncrementalIndex(c.projectRoot, changedFiles)
 	}
 
 	return c, nil
