@@ -3,48 +3,79 @@
 # See Architecture Section 12.2.
 #
 # This is the default image used when no language-specific image is configured.
+# Uses multi-stage build: compiles Go tools in a builder stage and copies
+# only the binaries into the final image to reduce size.
+#
+# Security: runs as non-root user (UID 1000), no secrets, no network at runtime.
 
-FROM golang:1.22-alpine AS go-base
+# ---------------------------------------------------------------------------
+# Stage 1: Build Go tools that need compilation
+# ---------------------------------------------------------------------------
+FROM golang:1.22-alpine AS go-builder
 
-# --- Stage 1: Go toolchain ---
-RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.61.0
 
-# --- Final stage: combine everything ---
+# ---------------------------------------------------------------------------
+# Stage 2: Final runtime image (Node base, adding Go + Python)
+# ---------------------------------------------------------------------------
 FROM node:20-alpine
 
-# Install system dependencies.
+# Install system dependencies:
+#   inotify-tools -- inotifywait for IPC file watching (Architecture Section 20.3)
+#   bash          -- entrypoint script
+#   git           -- required by Go/npm/pip for various operations
+#   python3       -- Python 3 runtime
+#   py3-pip       -- pip package manager
 RUN apk add --no-cache \
-    git \
-    inotify-tools \
-    bash \
-    python3 \
-    py3-pip \
+        inotify-tools \
+        bash \
+        git \
+        python3 \
+        py3-pip \
     && rm -rf /var/cache/apk/*
 
-# Copy Go from the go-base stage.
-COPY --from=go-base /usr/local/go /usr/local/go
-COPY --from=go-base /root/go/bin/golangci-lint /usr/local/bin/golangci-lint
+# Copy the full Go toolchain from the builder stage.
+COPY --from=go-builder /usr/local/go /usr/local/go
+COPY --from=go-builder /go/bin/golangci-lint /usr/local/bin/golangci-lint
 ENV PATH="/usr/local/go/bin:${PATH}"
 ENV GOPATH="/home/axiom/go"
 
 # Install Node.js global tools.
-RUN npm install -g typescript eslint
+RUN npm install -g typescript eslint && \
+    npm cache clean --force
 
-# Install Python tools.
+# Install Python development tools.
+# --break-system-packages is required on newer Alpine/Python to install
+# into the system Python without a venv.
 RUN pip3 install --no-cache-dir --break-system-packages ruff mypy pytest
 
-# Create non-root user.
+# Create non-root user (UID 1000) per Architecture Section 12.6.1.
+# Node Alpine images may already have a user at UID 1000 (node), so handle
+# the case where the group or user already exists.
 RUN addgroup -g 1000 axiom 2>/dev/null || true && \
     adduser -u 1000 -G axiom -D -h /home/axiom axiom 2>/dev/null || true
 
-# Create workspace directories.
-RUN mkdir -p /workspace/spec /workspace/staging /workspace/ipc/input /workspace/ipc/output && \
-    chown -R axiom:axiom /workspace && \
-    mkdir -p /home/axiom/go && chown axiom:axiom /home/axiom/go
+# Create workspace directories per Architecture Section 12.3.
+#   /workspace/spec        -- read-only TaskSpec/ReviewSpec input
+#   /workspace/staging     -- read-write Meeseeks output
+#   /workspace/ipc/input   -- engine -> container messages
+#   /workspace/ipc/output  -- container -> engine messages
+# Also create GOPATH directory for the non-root user.
+RUN mkdir -p \
+        /workspace/spec \
+        /workspace/staging \
+        /workspace/ipc/input \
+        /workspace/ipc/output \
+        /home/axiom/go && \
+    chown -R axiom:axiom /workspace /home/axiom/go
 
-COPY docker/ipc-watcher.sh /usr/local/bin/ipc-watcher
-RUN chmod +x /usr/local/bin/ipc-watcher
+# Copy and install the IPC watcher entrypoint script.
+COPY docker/axiom-entrypoint.sh /usr/local/bin/axiom-entrypoint.sh
+RUN chmod +x /usr/local/bin/axiom-entrypoint.sh
 
-USER axiom
+# Switch to non-root user.
+USER 1000:1000
 WORKDIR /workspace
-ENTRYPOINT ["/usr/local/bin/ipc-watcher"]
+
+# Default entrypoint: run the IPC watcher.
+ENTRYPOINT ["/usr/local/bin/axiom-entrypoint.sh"]

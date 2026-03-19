@@ -2,36 +2,58 @@
 # Contains Go toolchain + golangci-lint for Go projects.
 # See Architecture Section 12.2.
 #
-# Security: runs as non-root user, no secrets, no network at runtime.
+# Security: runs as non-root user (UID 1000), no secrets, no network at runtime.
+# Uses multi-stage build for minimal final image size.
 
-FROM golang:1.22-alpine AS base
+# ---------------------------------------------------------------------------
+# Stage 1: Build tools that need compilation
+# ---------------------------------------------------------------------------
+FROM golang:1.22-alpine AS builder
 
-# Install build tools and inotify-tools for IPC watching.
+RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.61.0
+
+# ---------------------------------------------------------------------------
+# Stage 2: Final runtime image
+# ---------------------------------------------------------------------------
+FROM golang:1.22-alpine
+
+# Install only the packages required at runtime:
+#   inotify-tools -- inotifywait for IPC file watching (Architecture Section 20.3)
+#   bash          -- entrypoint script
+#   git           -- required by Go toolchain and golangci-lint
 RUN apk add --no-cache \
-    git \
-    inotify-tools \
-    bash \
+        inotify-tools \
+        bash \
+        git \
     && rm -rf /var/cache/apk/*
 
-# Install golangci-lint.
-RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+# Copy golangci-lint from builder stage.
+COPY --from=builder /go/bin/golangci-lint /usr/local/bin/golangci-lint
 
-# Create non-root user per Architecture Section 12.6.1.
+# Create non-root user (UID 1000) per Architecture Section 12.6.1.
 RUN addgroup -g 1000 axiom && \
     adduser -u 1000 -G axiom -D -h /home/axiom axiom
 
 # Create workspace directories per Architecture Section 12.3.
-RUN mkdir -p /workspace/spec /workspace/staging /workspace/ipc/input /workspace/ipc/output && \
+#   /workspace/spec        -- read-only TaskSpec/ReviewSpec input
+#   /workspace/staging     -- read-write Meeseeks output
+#   /workspace/ipc/input   -- engine -> container messages
+#   /workspace/ipc/output  -- container -> engine messages
+RUN mkdir -p \
+        /workspace/spec \
+        /workspace/staging \
+        /workspace/ipc/input \
+        /workspace/ipc/output && \
     chown -R axiom:axiom /workspace
 
-# Copy IPC watcher script.
-COPY docker/ipc-watcher.sh /usr/local/bin/ipc-watcher
-RUN chmod +x /usr/local/bin/ipc-watcher
+# Copy and install the IPC watcher entrypoint script.
+COPY docker/axiom-entrypoint.sh /usr/local/bin/axiom-entrypoint.sh
+RUN chmod +x /usr/local/bin/axiom-entrypoint.sh
 
 # Switch to non-root user.
-USER axiom
+USER 1000:1000
 WORKDIR /workspace
 
 # Default entrypoint: run the IPC watcher.
 # The engine delivers TaskSpecs via IPC; the agent processes them.
-ENTRYPOINT ["/usr/local/bin/ipc-watcher"]
+ENTRYPOINT ["/usr/local/bin/axiom-entrypoint.sh"]

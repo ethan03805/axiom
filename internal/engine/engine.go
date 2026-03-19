@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -48,7 +49,9 @@ func New(config *Config) (*Engine, error) {
 	emitter.SubscribeAll(func(event events.Event) {
 		details := ""
 		if event.Details != nil {
-			details = fmt.Sprintf("%v", event.Details)
+			if b, err := json.Marshal(event.Details); err == nil {
+				details = string(b)
+			}
 		}
 		_ = db.InsertEvent(&state.Event{
 			Type:      string(event.Type),

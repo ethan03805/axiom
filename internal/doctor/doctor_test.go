@@ -8,10 +8,11 @@ func TestDoctorRunsAllChecks(t *testing.T) {
 	d := New(DoctorConfig{})
 	report := d.Run()
 
-	// Should have at least the core checks (Docker, Git, resources, BitNet,
-	// OpenRouter, config, secret patterns).
-	if len(report.Checks) < 7 {
-		t.Errorf("expected at least 7 checks, got %d", len(report.Checks))
+	// Should have at least the core checks: Docker, Git, resources, BitNet server,
+	// BitNet local inference, OpenRouter key, OpenRouter connectivity, disk space,
+	// config, secret patterns = 10.
+	if len(report.Checks) < 10 {
+		t.Errorf("expected at least 10 checks, got %d", len(report.Checks))
 	}
 
 	// Verify check names are populated.
@@ -113,6 +114,76 @@ func TestDoctorWarmPoolNotEnabled(t *testing.T) {
 		if c.Name == "Warm Pool Images" {
 			t.Error("warm pool check should not run when disabled")
 		}
+	}
+}
+
+func TestDoctorChecksBitNet(t *testing.T) {
+	// BitNet is typically not running in test environments, expect warning.
+	d := New(DoctorConfig{})
+	result := d.checkBitNet()
+
+	if result.Name != "BitNet Local Inference" {
+		t.Errorf("name = %s", result.Name)
+	}
+	// Since BitNet is not running in test, expect warning.
+	if result.Status != StatusWarning && result.Status != StatusPass {
+		t.Errorf("expected warning or pass, got %s", result.Status)
+	}
+}
+
+func TestDoctorChecksBitNetCustomHostPort(t *testing.T) {
+	d := New(DoctorConfig{
+		BitNetHost: "127.0.0.1",
+		BitNetPort: 9999,
+	})
+	result := d.checkBitNet()
+
+	if result.Name != "BitNet Local Inference" {
+		t.Errorf("name = %s", result.Name)
+	}
+	// Unreachable host/port should produce a warning.
+	if result.Status != StatusWarning {
+		t.Errorf("expected warning for unreachable BitNet, got %s: %s", result.Status, result.Message)
+	}
+}
+
+func TestDoctorChecksOpenRouterKey(t *testing.T) {
+	d := New(DoctorConfig{})
+	result := d.checkOpenRouterKey()
+
+	if result.Name != "OpenRouter API Key" {
+		t.Errorf("name = %s", result.Name)
+	}
+	// The result depends on environment. Just verify it returns a valid status.
+	if result.Status != StatusPass && result.Status != StatusWarning {
+		t.Errorf("expected pass or warning, got %s", result.Status)
+	}
+}
+
+func TestDoctorChecksDiskSpace(t *testing.T) {
+	d := New(DoctorConfig{ProjectRoot: "/"})
+	result := d.checkDiskSpace()
+
+	if result.Name != "Disk Space" {
+		t.Errorf("name = %s", result.Name)
+	}
+	// Root partition should almost always have space in a test environment.
+	if result.Status == StatusWarning {
+		t.Skipf("disk space check could not run: %s", result.Message)
+	}
+}
+
+func TestDoctorChecksDiskSpaceDefaultPath(t *testing.T) {
+	d := New(DoctorConfig{}) // Empty ProjectRoot defaults to "."
+	result := d.checkDiskSpace()
+
+	if result.Name != "Disk Space" {
+		t.Errorf("name = %s", result.Name)
+	}
+	// Should be able to check current directory.
+	if result.Status != StatusPass && result.Status != StatusFail {
+		// Warning means syscall error, which is unexpected for "."
+		t.Logf("disk space check status: %s - %s", result.Status, result.Message)
 	}
 }
 

@@ -2,12 +2,15 @@ package container
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
 
+	dockercontainer "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 
 	"github.com/ethan03805/axiom/internal/events"
@@ -147,21 +150,28 @@ func (vs *ValidationSandbox) Validate(ctx context.Context, taskID, stagingDir, p
 		AgentID:   containerName,
 	})
 
-	// The actual validation execution happens inside the container.
-	// In the real system, the container runs the profile commands and
-	// writes results to a mounted output directory. Here we simulate
-	// the structured result that would come back.
-	//
-	// For now, this is a placeholder that returns the result structure.
-	// The actual container execution will be wired in when the Docker
-	// images are built (Phase 21).
-	result.CompilePass = true
-	result.LintPass = true
-	result.TestPass = true
+	// Wait for the validation container to exit and read results.
+	// The container runs the profile commands internally and writes a
+	// structured result file to the mounted working directory.
+	timeout := time.Duration(vs.config.TimeoutMinutes) * time.Minute
+	if timeout == 0 {
+		timeout = 10 * time.Minute
+	}
 
-	// Clean up.
+	exitReason := "completed"
+	result, waitErr := vs.waitForContainerExit(ctx, resp.ID, containerName, workDir, timeout)
+	if waitErr != nil {
+		exitReason = "error"
+		// If we timed out or failed to read results, we still need to
+		// clean up the container and return whatever information we have.
+		if result == nil {
+			result = &pipeline.ValidationResult{}
+		}
+	}
+
+	// Clean up the container.
 	_ = vs.docker.ContainerRemove(ctx, resp.ID, removeOptions(true))
-	_ = vs.db.UpdateContainerSessionStopped(containerName, time.Now(), "completed")
+	_ = vs.db.UpdateContainerSessionStopped(containerName, time.Now(), exitReason)
 
 	vs.emitter.Emit(events.Event{
 		Type:      events.EventContainerDestroyed,
@@ -170,25 +180,263 @@ func (vs *ValidationSandbox) Validate(ctx context.Context, taskID, stagingDir, p
 		AgentID:   containerName,
 	})
 
+	if waitErr != nil {
+		return result, fmt.Errorf("validation container %s: %w", containerName, waitErr)
+	}
+
 	return result, nil
+}
+
+// overlaySkipDirs lists directories that are skipped during the project copy
+// to keep overlay creation fast. These directories are either Axiom-internal,
+// version control metadata, or large dependency trees that are mounted
+// separately via read-only cache mounts.
+var overlaySkipDirs = map[string]bool{
+	".axiom":       true,
+	".git":         true,
+	"node_modules": true,
 }
 
 // createOverlay creates a working directory that combines the project state
 // with the Meeseeks' staged output. Files from staging override project files.
+//
+// The overlay approach per Architecture Section 13.3: read-only snapshot of
+// project at HEAD (base layer) + writable layer with Meeseeks output applied.
+// Since we are running in a Docker container with bind mounts, a directory
+// copy with override is sufficient.
+//
+// Steps:
+//  1. Create a temp working directory.
+//  2. Copy project directory contents to the working directory (base layer),
+//     skipping .axiom/, .git/, and node_modules/ for speed.
+//  3. Copy staging directory contents on top (overlay layer), overriding any
+//     project files that the Meeseeks modified.
 func (vs *ValidationSandbox) createOverlay(taskID, stagingDir, projectDir string) (string, error) {
 	workDir, err := os.MkdirTemp("", fmt.Sprintf("axiom-validate-%s-*", taskID))
 	if err != nil {
 		return "", fmt.Errorf("create work dir: %w", err)
 	}
 
-	// Copy project files to the working directory.
-	// In production, this would use a more efficient mechanism (bind mount
-	// with overlayfs or copy-on-write). For now, we create the directory
-	// structure and the pipeline will handle the overlay.
-	//
-	// The key property: project files are the base, staging files override.
+	// Step 1: Copy project files as the base layer. We use cp -a to preserve
+	// permissions and timestamps. The --exclude flags are not portable with
+	// cp, so we enumerate top-level entries and skip the excluded directories.
+	if err := vs.copyProjectToWorkDir(projectDir, workDir); err != nil {
+		os.RemoveAll(workDir)
+		return "", fmt.Errorf("copy project base layer: %w", err)
+	}
+
+	// Step 2: Copy staging directory contents on top as the overlay layer.
+	// This overrides any project files that the Meeseeks modified.
+	if err := vs.copyStagingToWorkDir(stagingDir, workDir); err != nil {
+		os.RemoveAll(workDir)
+		return "", fmt.Errorf("copy staging overlay layer: %w", err)
+	}
 
 	return workDir, nil
+}
+
+// copyProjectToWorkDir copies the project directory contents into the working
+// directory, skipping directories listed in overlaySkipDirs. Each non-skipped
+// top-level entry is copied using `cp -a` via exec.Command.
+func (vs *ValidationSandbox) copyProjectToWorkDir(projectDir, workDir string) error {
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return fmt.Errorf("read project dir: %w", err)
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+
+		// Skip directories that should not be part of the validation overlay.
+		if entry.IsDir() && overlaySkipDirs[name] {
+			continue
+		}
+
+		src := filepath.Join(projectDir, name)
+		dst := filepath.Join(workDir, name)
+
+		// Use cp -a to preserve attributes (permissions, timestamps, symlinks).
+		cmd := exec.Command("cp", "-a", src, dst)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("cp -a %s %s: %w: %s", src, dst, err, string(output))
+		}
+	}
+
+	return nil
+}
+
+// copyStagingToWorkDir copies the Meeseeks staging directory contents into the
+// working directory. Staging files override project files (this is the overlay
+// layer). Uses `cp -a` to ensure the full staging tree is applied.
+func (vs *ValidationSandbox) copyStagingToWorkDir(stagingDir, workDir string) error {
+	entries, err := os.ReadDir(stagingDir)
+	if err != nil {
+		// An empty or missing staging dir is not an error -- there may simply
+		// be no staged files (e.g., a deletion-only manifest).
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read staging dir: %w", err)
+	}
+
+	if len(entries) == 0 {
+		return nil
+	}
+
+	for _, entry := range entries {
+		src := filepath.Join(stagingDir, entry.Name())
+		dst := filepath.Join(workDir, entry.Name())
+
+		// Use cp -a to preserve attributes and recursively copy.
+		cmd := exec.Command("cp", "-a", src, dst)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("cp -a %s %s: %w: %s", src, dst, err, string(output))
+		}
+	}
+
+	return nil
+}
+
+// validationResultFile is the well-known filename that validation containers
+// write their structured results to inside the mounted working directory.
+const validationResultFile = ".axiom-validation-result.json"
+
+// containerPollInterval is the interval between polling checks when waiting
+// for a validation container to exit. The DockerClient interface does not
+// expose ContainerWait, so we poll ContainerList instead.
+const containerPollInterval = 2 * time.Second
+
+// validationResultJSON is the JSON structure that the validation container
+// writes to the result file. This mirrors pipeline.ValidationResult but is
+// defined separately for serialization/deserialization at the container
+// boundary.
+type validationResultJSON struct {
+	CompilePass   bool     `json:"compile_pass"`
+	CompileError  string   `json:"compile_error,omitempty"`
+	LintPass      bool     `json:"lint_pass"`
+	LintError     string   `json:"lint_error,omitempty"`
+	LintWarnings  []string `json:"lint_warnings,omitempty"`
+	TestPass      bool     `json:"test_pass"`
+	TestError     string   `json:"test_error,omitempty"`
+	TestCount     int      `json:"test_count"`
+	TestPassed    int      `json:"test_passed"`
+	SecurityPass  bool     `json:"security_pass"`
+	SecurityError string   `json:"security_error,omitempty"`
+}
+
+// waitForContainerExit polls the Docker daemon to determine when the
+// validation container has exited, then reads and parses the structured
+// result file from the working directory.
+//
+// Since the DockerClient interface does not include ContainerWait, this
+// method polls ContainerList to check if the container is still running.
+// It respects the provided timeout; if the container does not exit within
+// the timeout, it is killed and an error is returned.
+func (vs *ValidationSandbox) waitForContainerExit(
+	ctx context.Context,
+	containerID string,
+	containerName string,
+	workDir string,
+	timeout time.Duration,
+) (*pipeline.ValidationResult, error) {
+	deadline := time.Now().Add(timeout)
+
+	// Poll until the container exits or we hit the timeout.
+	for {
+		if time.Now().After(deadline) {
+			// Timeout: kill the container.
+			_ = vs.docker.ContainerKill(ctx, containerID, "KILL")
+			return nil, fmt.Errorf("validation timed out after %s", timeout)
+		}
+
+		running, err := vs.isContainerRunning(ctx, containerID)
+		if err != nil {
+			return nil, fmt.Errorf("check container status: %w", err)
+		}
+
+		if !running {
+			break
+		}
+
+		// Wait before polling again.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(containerPollInterval):
+		}
+	}
+
+	// Container has exited. Read the result file.
+	return vs.readValidationResult(workDir)
+}
+
+// isContainerRunning checks whether the given container ID is still in a
+// running state by querying ContainerList. Returns false if the container
+// is not found or is in a non-running state.
+func (vs *ValidationSandbox) isContainerRunning(ctx context.Context, containerID string) (bool, error) {
+	containers, err := vs.docker.ContainerList(ctx, dockercontainer.ListOptions{
+		All: true, // Include stopped containers so we can distinguish "exited" from "not found"
+	})
+	if err != nil {
+		return false, fmt.Errorf("list containers: %w", err)
+	}
+
+	for _, c := range containers {
+		if c.ID == containerID {
+			return c.State == "running", nil
+		}
+	}
+
+	// Container not found in the list -- it has been removed or never existed.
+	return false, nil
+}
+
+// readValidationResult reads and parses the validation result JSON file from
+// the working directory. If the result file does not exist (e.g., the container
+// crashed before writing it), a default failing result is returned with an
+// appropriate error message.
+func (vs *ValidationSandbox) readValidationResult(workDir string) (*pipeline.ValidationResult, error) {
+	resultPath := filepath.Join(workDir, validationResultFile)
+
+	data, err := os.ReadFile(resultPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// The container exited without writing a result file. This
+			// typically means the container crashed or the validation
+			// script failed to run. Return a failing result.
+			return &pipeline.ValidationResult{
+				CompilePass:  false,
+				CompileError: "validation container exited without writing results",
+				LintPass:     false,
+				LintError:    "validation container exited without writing results",
+				TestPass:     false,
+				TestError:    "validation container exited without writing results",
+			}, fmt.Errorf("validation result file not found: container may have crashed")
+		}
+		return nil, fmt.Errorf("read validation result: %w", err)
+	}
+
+	var raw validationResultJSON
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return &pipeline.ValidationResult{
+			CompilePass:  false,
+			CompileError: "failed to parse validation result JSON",
+		}, fmt.Errorf("parse validation result: %w", err)
+	}
+
+	return &pipeline.ValidationResult{
+		CompilePass:   raw.CompilePass,
+		CompileError:  raw.CompileError,
+		LintPass:      raw.LintPass,
+		LintError:     raw.LintError,
+		LintWarnings:  raw.LintWarnings,
+		TestPass:      raw.TestPass,
+		TestError:     raw.TestError,
+		TestCount:     raw.TestCount,
+		TestPassed:    raw.TestPassed,
+		SecurityPass:  raw.SecurityPass,
+		SecurityError: raw.SecurityError,
+	}, nil
 }
 
 // --- Warm Sandbox Pool ---

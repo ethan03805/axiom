@@ -1,29 +1,47 @@
 # Axiom Meeseeks Python Image
 # Contains Python 3 + pip + ruff + mypy for Python projects.
 # See Architecture Section 12.2.
+#
+# Security: runs as non-root user (UID 1000), no secrets, no network at runtime.
 
-FROM python:3.12-alpine AS base
+FROM python:3.12-alpine
 
+# Install only the packages required at runtime:
+#   inotify-tools -- inotifywait for IPC file watching (Architecture Section 20.3)
+#   bash          -- entrypoint script
+#   git           -- may be needed by pip for git dependencies
 RUN apk add --no-cache \
-    git \
-    inotify-tools \
-    bash \
+        inotify-tools \
+        bash \
+        git \
     && rm -rf /var/cache/apk/*
 
-# Install Python dev tools.
+# Install Python development tools.
 RUN pip install --no-cache-dir ruff mypy pytest
 
-# Create non-root user.
+# Create non-root user (UID 1000) per Architecture Section 12.6.1.
 RUN addgroup -g 1000 axiom && \
     adduser -u 1000 -G axiom -D -h /home/axiom axiom
 
-# Create workspace directories.
-RUN mkdir -p /workspace/spec /workspace/staging /workspace/ipc/input /workspace/ipc/output && \
+# Create workspace directories per Architecture Section 12.3.
+#   /workspace/spec        -- read-only TaskSpec/ReviewSpec input
+#   /workspace/staging     -- read-write Meeseeks output
+#   /workspace/ipc/input   -- engine -> container messages
+#   /workspace/ipc/output  -- container -> engine messages
+RUN mkdir -p \
+        /workspace/spec \
+        /workspace/staging \
+        /workspace/ipc/input \
+        /workspace/ipc/output && \
     chown -R axiom:axiom /workspace
 
-COPY docker/ipc-watcher.sh /usr/local/bin/ipc-watcher
-RUN chmod +x /usr/local/bin/ipc-watcher
+# Copy and install the IPC watcher entrypoint script.
+COPY docker/axiom-entrypoint.sh /usr/local/bin/axiom-entrypoint.sh
+RUN chmod +x /usr/local/bin/axiom-entrypoint.sh
 
-USER axiom
+# Switch to non-root user.
+USER 1000:1000
 WORKDIR /workspace
-ENTRYPOINT ["/usr/local/bin/ipc-watcher"]
+
+# Default entrypoint: run the IPC watcher.
+ENTRYPOINT ["/usr/local/bin/axiom-entrypoint.sh"]

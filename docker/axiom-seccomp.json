@@ -1,62 +1,160 @@
 {
   "defaultAction": "SCMP_ACT_ERRNO",
   "defaultErrnoRet": 1,
+  "comment": "Axiom Meeseeks/Reviewer container seccomp profile. Default-deny with an explicit allowlist of syscalls required for Go, Node.js, Python toolchains, inotify-based IPC watching, and general container operation. See Architecture Section 12.6.1.",
   "archMap": [
-    { "architecture": "SCMP_ARCH_X86_64", "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"] },
-    { "architecture": "SCMP_ARCH_AARCH64", "subArchitectures": ["SCMP_ARCH_ARM"] }
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
   ],
   "syscalls": [
     {
+      "comment": "Process lifecycle: fork, exec, exit, wait",
       "names": [
-        "accept", "accept4", "access", "arch_prctl", "bind", "brk",
-        "capget", "capset", "chdir", "chmod", "chown", "clock_getres",
-        "clock_gettime", "clock_nanosleep", "clone", "clone3", "close",
-        "connect", "copy_file_range", "dup", "dup2", "dup3",
-        "epoll_create", "epoll_create1", "epoll_ctl", "epoll_pwait",
-        "epoll_wait", "eventfd", "eventfd2", "execve", "execveat",
-        "exit", "exit_group", "faccessat", "faccessat2", "fadvise64",
-        "fallocate", "fchdir", "fchmod", "fchmodat", "fchown",
-        "fchownat", "fcntl", "fdatasync", "flock", "fork",
-        "fstat", "fstatfs", "fsync", "ftruncate", "futex",
-        "getcwd", "getdents", "getdents64", "getegid", "geteuid",
-        "getgid", "getgroups", "getpeername", "getpgrp", "getpid",
-        "getppid", "getpriority", "getrandom", "getresgid", "getresuid",
-        "getrlimit", "getrusage", "getsid", "getsockname", "getsockopt",
-        "gettid", "gettimeofday", "getuid",
-        "inotify_add_watch", "inotify_init", "inotify_init1", "inotify_rm_watch",
-        "ioctl", "kill",
-        "lchown", "link", "linkat", "listen", "lseek", "lstat",
-        "madvise", "membarrier", "memfd_create", "mincore", "mkdir",
-        "mkdirat", "mlock", "mlock2", "mmap", "mprotect", "mremap",
-        "msync", "munlock", "munmap",
-        "nanosleep", "newfstatat",
+        "clone", "clone3", "execve", "execveat", "exit", "exit_group",
+        "fork", "vfork", "wait4", "waitid"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "File I/O: open, read, write, close, stat, seek, sync",
+      "names": [
+        "access", "close", "copy_file_range", "dup", "dup2", "dup3",
+        "fadvise64", "fallocate", "fchdir", "fchmod", "fchmodat",
+        "fchown", "fchownat", "fcntl", "fdatasync", "flock",
+        "fstat", "fstatfs", "fsync", "ftruncate",
+        "getcwd", "getdents", "getdents64",
+        "lchown", "link", "linkat", "lseek", "lstat",
+        "mkdir", "mkdirat",
+        "newfstatat",
         "open", "openat", "openat2",
-        "pause", "pipe", "pipe2", "poll", "ppoll", "prctl",
-        "pread64", "preadv", "preadv2", "prlimit64", "pwrite64",
-        "pwritev", "pwritev2",
+        "pread64", "preadv", "preadv2", "pwrite64", "pwritev", "pwritev2",
         "read", "readahead", "readlink", "readlinkat", "readv",
-        "recvfrom", "recvmmsg", "recvmsg", "rename", "renameat",
-        "renameat2", "restart_syscall", "rmdir", "rseq",
+        "rename", "renameat", "renameat2", "rmdir",
+        "sendfile", "splice", "stat", "statfs", "statx",
+        "symlink", "symlinkat", "sync", "sync_file_range", "syncfs",
+        "tee", "truncate",
+        "umask", "unlink", "unlinkat", "utimensat",
+        "write", "writev",
+        "faccessat", "faccessat2"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "inotify: required for IPC file watching (Architecture Section 20.3)",
+      "names": [
+        "inotify_add_watch", "inotify_init", "inotify_init1", "inotify_rm_watch"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "Memory management: mmap, mprotect, brk, etc.",
+      "names": [
+        "brk", "madvise", "membarrier", "memfd_create", "mincore",
+        "mlock", "mlock2", "mmap", "mprotect", "mremap",
+        "msync", "munlock", "munmap"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "Signals",
+      "names": [
+        "kill", "pause", "restart_syscall",
         "rt_sigaction", "rt_sigpending", "rt_sigprocmask", "rt_sigqueueinfo",
         "rt_sigreturn", "rt_sigsuspend", "rt_sigtimedwait",
+        "sigaltstack", "tgkill", "tkill"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "Epoll and poll: event-driven I/O used by runtimes",
+      "names": [
+        "epoll_create", "epoll_create1", "epoll_ctl", "epoll_pwait", "epoll_wait",
+        "eventfd", "eventfd2",
+        "poll", "ppoll", "select"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "Pipe: inter-process communication within the container",
+      "names": [
+        "pipe", "pipe2"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "Scheduling and timing",
+      "names": [
+        "clock_getres", "clock_gettime", "clock_nanosleep",
+        "gettimeofday", "nanosleep", "time",
+        "timer_create", "timer_delete", "timer_getoverrun",
+        "timer_gettime", "timer_settime",
+        "timerfd_create", "timerfd_gettime", "timerfd_settime",
         "sched_getaffinity", "sched_getattr", "sched_getparam",
         "sched_get_priority_max", "sched_get_priority_min",
         "sched_getscheduler", "sched_setaffinity", "sched_setattr",
-        "sched_setparam", "sched_setscheduler", "sched_yield",
-        "seccomp", "select", "sendfile", "sendmmsg", "sendmsg",
-        "sendto", "set_robust_list", "set_tid_address",
-        "setgid", "setgroups", "setitimer", "setpgid", "setpriority",
-        "setregid", "setresgid", "setresuid", "setreuid", "setsid",
-        "setsockopt", "setuid",
-        "shutdown", "sigaltstack", "socket", "socketpair",
-        "splice", "stat", "statfs", "statx", "symlink", "symlinkat",
-        "sync", "sync_file_range", "syncfs", "sysinfo",
-        "tee", "tgkill", "time", "timer_create", "timer_delete",
-        "timer_getoverrun", "timer_gettime", "timer_settime",
-        "timerfd_create", "timerfd_gettime", "timerfd_settime",
-        "tkill", "truncate",
-        "umask", "uname", "unlink", "unlinkat", "unshare",
-        "utimensat", "vfork", "wait4", "waitid", "write", "writev"
+        "sched_setparam", "sched_setscheduler", "sched_yield"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "Process/thread identity and resource info",
+      "names": [
+        "arch_prctl", "capget", "capset", "chdir",
+        "getegid", "geteuid", "getgid", "getgroups",
+        "getpgrp", "getpid", "getppid", "getpriority",
+        "getrandom", "getresgid", "getresuid", "getrlimit",
+        "getrusage", "getsid", "gettid", "getuid",
+        "prctl", "prlimit64", "rseq",
+        "set_robust_list", "set_tid_address",
+        "setitimer", "setpgid", "setpriority",
+        "sysinfo", "uname"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "Futex: required by Go runtime, Node.js, Python threading",
+      "names": [
+        "futex"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "Socket: limited to local/IPC sockets only (network=none enforced by Docker)",
+      "names": [
+        "accept", "accept4", "bind", "connect",
+        "getpeername", "getsockname", "getsockopt",
+        "listen", "recvfrom", "recvmmsg", "recvmsg",
+        "sendmmsg", "sendmsg", "sendto",
+        "setsockopt", "shutdown", "socket", "socketpair"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "UID/GID management: required for non-root user setup",
+      "names": [
+        "chmod", "chown",
+        "setgid", "setgroups", "setregid", "setresgid",
+        "setresuid", "setreuid", "setsid", "setuid"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "Seccomp and namespace: allow reading own seccomp state",
+      "names": [
+        "seccomp", "unshare"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "ioctl: needed by terminal/tty operations and Go runtime",
+      "names": [
+        "ioctl"
       ],
       "action": "SCMP_ACT_ALLOW"
     }

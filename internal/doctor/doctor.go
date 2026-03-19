@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -39,12 +40,13 @@ type Report struct {
 
 // DoctorConfig holds configuration for the doctor checks.
 type DoctorConfig struct {
-	BitNetHost       string
-	BitNetPort       int
-	DockerImage      string
+	BitNetHost        string
+	BitNetPort        int
+	DockerImage       string
 	SensitivePatterns []string
-	WarmPoolEnabled  bool
-	WarmPoolImage    string
+	WarmPoolEnabled   bool
+	WarmPoolImage     string
+	ProjectRoot       string // Project root path for disk space check
 }
 
 // Doctor performs comprehensive system diagnostics.
@@ -66,7 +68,10 @@ func (d *Doctor) Run() *Report {
 		d.checkGit,
 		d.checkSystemResources,
 		d.checkBitNetServer,
+		d.checkBitNet,
+		d.checkOpenRouterKey,
 		d.checkOpenRouterConnectivity,
+		d.checkDiskSpace,
 		d.checkProjectConfig,
 		d.checkSecretPatterns,
 	}
@@ -259,6 +264,102 @@ func (d *Doctor) checkSecretPatterns() CheckResult {
 		Name:    "Secret Scanner Patterns",
 		Status:  StatusPass,
 		Message: fmt.Sprintf("%d custom patterns valid", len(patterns)),
+	}
+}
+
+// checkBitNet performs a direct HTTP GET to localhost:3002/v1/models to
+// verify the BitNet local inference server is reachable.
+// See Architecture Section 27.7.
+func (d *Doctor) checkBitNet() CheckResult {
+	host := d.config.BitNetHost
+	port := d.config.BitNetPort
+	if host == "" {
+		host = "localhost"
+	}
+	if port == 0 {
+		port = 3002
+	}
+
+	url := fmt.Sprintf("http://%s:%d/v1/models", host, port)
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return CheckResult{
+			Name:    "BitNet Local Inference",
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("BitNet server not reachable at %s (local inference unavailable)", url),
+		}
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		return CheckResult{
+			Name:    "BitNet Local Inference",
+			Status:  StatusPass,
+			Message: fmt.Sprintf("BitNet server responding at %s:%d", host, port),
+		}
+	}
+
+	return CheckResult{
+		Name:    "BitNet Local Inference",
+		Status:  StatusWarning,
+		Message: fmt.Sprintf("BitNet server returned status %d at %s", resp.StatusCode, url),
+	}
+}
+
+// checkOpenRouterKey checks if the OPENROUTER_API_KEY environment variable is set.
+// See Architecture Section 27.7.
+func (d *Doctor) checkOpenRouterKey() CheckResult {
+	key := os.Getenv("OPENROUTER_API_KEY")
+	if key == "" {
+		return CheckResult{
+			Name:    "OpenRouter API Key",
+			Status:  StatusWarning,
+			Message: "OPENROUTER_API_KEY not set (external inference unavailable)",
+		}
+	}
+
+	return CheckResult{
+		Name:    "OpenRouter API Key",
+		Status:  StatusPass,
+		Message: "OPENROUTER_API_KEY is set",
+	}
+}
+
+// checkDiskSpace verifies that the project root has at least 1 GB of free space.
+// See Architecture Section 27.7.
+func (d *Doctor) checkDiskSpace() CheckResult {
+	path := d.config.ProjectRoot
+	if path == "" {
+		path = "."
+	}
+
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return CheckResult{
+			Name:    "Disk Space",
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("Unable to check disk space: %v", err),
+		}
+	}
+
+	// Available space in bytes = available blocks * block size.
+	availableBytes := stat.Bavail * uint64(stat.Bsize)
+	availableGB := float64(availableBytes) / (1024 * 1024 * 1024)
+
+	const minRequiredGB = 1.0
+	if availableGB < minRequiredGB {
+		return CheckResult{
+			Name:    "Disk Space",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("Only %.2f GB free (minimum 1 GB required)", availableGB),
+		}
+	}
+
+	return CheckResult{
+		Name:    "Disk Space",
+		Status:  StatusPass,
+		Message: fmt.Sprintf("%.1f GB free", availableGB),
 	}
 }
 

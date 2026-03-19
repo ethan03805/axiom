@@ -6,7 +6,9 @@ package git
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -132,10 +134,10 @@ func (m *Manager) Commit(meta *CommitMetadata) (string, error) {
 // Files from stagingDir are copied to their declared paths relative to rootDir.
 func (m *Manager) ApplyFiles(files map[string]string) error {
 	for relPath, content := range files {
-		fullPath := m.rootDir + "/" + relPath
+		fullPath := filepath.Join(m.rootDir, relPath)
 		// Ensure parent directory exists.
-		dir := fullPath[:strings.LastIndex(fullPath, "/")]
-		if _, err := exec.Command("mkdir", "-p", dir).Output(); err != nil {
+		dir := filepath.Dir(fullPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", dir, err)
 		}
 		if err := writeFile(fullPath, content); err != nil {
@@ -237,7 +239,7 @@ func (m *Manager) run(args ...string) (string, error) {
 	return string(output), nil
 }
 
-// writeFile writes content to a file, creating parent directories as needed.
+// writeFile writes content to a file using os.WriteFile.
 func writeFile(path, content string) error {
-	return exec.Command("sh", "-c", fmt.Sprintf("cat > %q << 'AXIOM_EOF'\n%s\nAXIOM_EOF", path, content)).Run()
+	return os.WriteFile(path, []byte(content), 0644)
 }
