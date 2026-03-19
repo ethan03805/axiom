@@ -9,6 +9,12 @@ bin/
 # Go vendor directory
 vendor/
 
+# BitNet build artifacts and model weights (large files)
+third_party/BitNet/build/
+third_party/BitNet/models/
+third_party/BitNet/.venv/
+third_party/BitNet/3rdparty/
+
 # Axiom runtime data
 .axiom/axiom.db
 .axiom/containers/
@@ -30,6 +36,10 @@ coverage.html
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local test projects
+test_projects/
+AXIOM_TEST_RESULTS/
 
 # Project documentation (not for GitHub)
 Architecture.md

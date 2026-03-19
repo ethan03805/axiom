@@ -292,8 +292,24 @@ var pauseCmd = &cobra.Command{
 			return err
 		}
 		defer coord.Stop()
+
+		active := coord.ActiveContainerCount()
+		tasks, _ := coord.DB().ListTasks(state.TaskFilter{})
+		inProgress := 0
+		for _, t := range tasks {
+			if t.Status == "in_progress" || t.Status == "in_review" {
+				inProgress++
+			}
+		}
+
 		coord.Pause()
-		fmt.Println("Execution paused. Active Meeseeks will complete their current tasks.")
+
+		if active == 0 && inProgress == 0 {
+			fmt.Println("No active execution to pause (no running containers or in-progress tasks).")
+			fmt.Println("Pause state has been set. New tasks will not be dispatched until resumed.")
+		} else {
+			fmt.Printf("Execution paused. %d active container(s), %d in-progress task(s) will complete their current work.\n", active, inProgress)
+		}
 		fmt.Println("Run 'axiom resume' to continue.")
 		return nil
 	},
@@ -310,8 +326,14 @@ var resumeCmd = &cobra.Command{
 			return err
 		}
 		defer coord.Stop()
+
+		if !coord.IsPaused() {
+			fmt.Println("Execution is not currently paused.")
+			return nil
+		}
+
 		coord.Resume()
-		fmt.Println("Execution resumed.")
+		fmt.Println("Execution resumed. Task dispatching will continue.")
 		return nil
 	},
 }
@@ -328,10 +350,27 @@ var cancelCmd = &cobra.Command{
 			return err
 		}
 		defer coord.Stop()
+
+		active := coord.ActiveContainerCount()
+		tasks, _ := coord.DB().ListTasks(state.TaskFilter{})
+		inProgress := 0
+		for _, t := range tasks {
+			if t.Status == "in_progress" || t.Status == "in_review" {
+				inProgress++
+			}
+		}
+
 		if err := coord.Cancel(cmd.Context()); err != nil {
 			return fmt.Errorf("cancel: %w", err)
 		}
-		fmt.Println("Execution cancelled. Containers killed, uncommitted changes reverted.")
+
+		if active == 0 && inProgress == 0 {
+			fmt.Println("No active execution to cancel (no running containers or in-progress tasks).")
+			fmt.Println("Project state has been marked as cancelled.")
+		} else {
+			fmt.Printf("Execution cancelled. %d container(s) killed, %d in-progress task(s) stopped.\n", active, inProgress)
+			fmt.Println("Uncommitted changes reverted.")
+		}
 		return nil
 	},
 }

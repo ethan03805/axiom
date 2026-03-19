@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"regexp"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -47,6 +47,7 @@ type DoctorConfig struct {
 	WarmPoolEnabled   bool
 	WarmPoolImage     string
 	ProjectRoot       string // Project root path for disk space check
+	OpenRouterAPIKey  string // API key from config file (checked alongside env var)
 }
 
 // Doctor performs comprehensive system diagnostics.
@@ -250,12 +251,19 @@ func (d *Doctor) checkSecretPatterns() CheckResult {
 	}
 
 	for _, p := range patterns {
-		_, err := regexp.Compile(p)
-		if err != nil {
-			return CheckResult{
-				Name:    "Secret Scanner Patterns",
-				Status:  StatusFail,
-				Message: fmt.Sprintf("Invalid regex pattern '%s': %v", p, err),
+		// Sensitive patterns are glob patterns used by filepath.Match
+		// in the security package (IsSensitivePath). Patterns containing
+		// "**" are handled by the security scanner's substring fallback
+		// logic and are valid. For other patterns, validate with
+		// filepath.Match.
+		if !strings.Contains(p, "**") {
+			_, err := filepath.Match(p, "test")
+			if err != nil {
+				return CheckResult{
+					Name:    "Secret Scanner Patterns",
+					Status:  StatusFail,
+					Message: fmt.Sprintf("Invalid glob pattern '%s': %v", p, err),
+				}
 			}
 		}
 	}
@@ -307,22 +315,34 @@ func (d *Doctor) checkBitNet() CheckResult {
 	}
 }
 
-// checkOpenRouterKey checks if the OPENROUTER_API_KEY environment variable is set.
-// See Architecture Section 27.7.
+// checkOpenRouterKey checks if the OpenRouter API key is configured via
+// either the OPENROUTER_API_KEY environment variable or the config file's
+// [openrouter] api_key field.
+// See Architecture Section 27.7 and Section 4.6 (credential management).
 func (d *Doctor) checkOpenRouterKey() CheckResult {
-	key := os.Getenv("OPENROUTER_API_KEY")
-	if key == "" {
+	envKey := os.Getenv("OPENROUTER_API_KEY")
+	configKey := d.config.OpenRouterAPIKey
+
+	if envKey != "" {
 		return CheckResult{
 			Name:    "OpenRouter API Key",
-			Status:  StatusWarning,
-			Message: "OPENROUTER_API_KEY not set (external inference unavailable)",
+			Status:  StatusPass,
+			Message: "OPENROUTER_API_KEY set via environment variable",
+		}
+	}
+
+	if configKey != "" {
+		return CheckResult{
+			Name:    "OpenRouter API Key",
+			Status:  StatusPass,
+			Message: "OpenRouter API key configured in config file",
 		}
 	}
 
 	return CheckResult{
 		Name:    "OpenRouter API Key",
-		Status:  StatusPass,
-		Message: "OPENROUTER_API_KEY is set",
+		Status:  StatusWarning,
+		Message: "OpenRouter API key not set (check OPENROUTER_API_KEY env var or [openrouter] api_key in config)",
 	}
 }
 

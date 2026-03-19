@@ -1,6 +1,6 @@
 -- Axiom initial schema migration
 -- Tasks: durable identity and metadata
-CREATE TABLE tasks (
+CREATE TABLE IF NOT EXISTS tasks (
     id              TEXT PRIMARY KEY,
     parent_id       TEXT REFERENCES tasks(id),
     title           TEXT NOT NULL,
@@ -15,26 +15,26 @@ CREATE TABLE tasks (
     completed_at    DATETIME
 );
 
-CREATE TABLE task_srs_refs (
+CREATE TABLE IF NOT EXISTS task_srs_refs (
     task_id     TEXT NOT NULL REFERENCES tasks(id),
     srs_ref     TEXT NOT NULL,
     PRIMARY KEY (task_id, srs_ref)
 );
 
-CREATE TABLE task_dependencies (
+CREATE TABLE IF NOT EXISTS task_dependencies (
     task_id    TEXT NOT NULL REFERENCES tasks(id),
     depends_on TEXT NOT NULL REFERENCES tasks(id),
     PRIMARY KEY (task_id, depends_on)
 );
 
-CREATE TABLE task_target_files (
+CREATE TABLE IF NOT EXISTS task_target_files (
     task_id     TEXT NOT NULL REFERENCES tasks(id),
     file_path   TEXT NOT NULL,
     lock_scope  TEXT NOT NULL DEFAULT 'file',
     PRIMARY KEY (task_id, file_path)
 );
 
-CREATE TABLE task_locks (
+CREATE TABLE IF NOT EXISTS task_locks (
     resource_type TEXT NOT NULL,
     resource_key  TEXT NOT NULL,
     task_id       TEXT NOT NULL REFERENCES tasks(id),
@@ -42,7 +42,7 @@ CREATE TABLE task_locks (
     PRIMARY KEY (resource_type, resource_key)
 );
 
-CREATE TABLE task_attempts (
+CREATE TABLE IF NOT EXISTS task_attempts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id         TEXT NOT NULL REFERENCES tasks(id),
     attempt_number  INTEGER NOT NULL,
@@ -59,7 +59,7 @@ CREATE TABLE task_attempts (
     completed_at    DATETIME
 );
 
-CREATE TABLE validation_runs (
+CREATE TABLE IF NOT EXISTS validation_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     attempt_id      INTEGER NOT NULL REFERENCES task_attempts(id),
     check_type      TEXT NOT NULL,
@@ -69,7 +69,7 @@ CREATE TABLE validation_runs (
     timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE review_runs (
+CREATE TABLE IF NOT EXISTS review_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     attempt_id      INTEGER NOT NULL REFERENCES task_attempts(id),
     reviewer_model  TEXT NOT NULL,
@@ -80,7 +80,7 @@ CREATE TABLE review_runs (
     timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE task_artifacts (
+CREATE TABLE IF NOT EXISTS task_artifacts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     attempt_id      INTEGER NOT NULL REFERENCES task_attempts(id),
     file_path       TEXT NOT NULL,
@@ -90,7 +90,7 @@ CREATE TABLE task_artifacts (
     timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE container_sessions (
+CREATE TABLE IF NOT EXISTS container_sessions (
     id              TEXT PRIMARY KEY,
     task_id         TEXT NOT NULL REFERENCES tasks(id),
     container_type  TEXT NOT NULL,
@@ -103,7 +103,7 @@ CREATE TABLE container_sessions (
     exit_reason     TEXT
 );
 
-CREATE TABLE events (
+CREATE TABLE IF NOT EXISTS events (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     event_type      TEXT NOT NULL,
     task_id         TEXT,
@@ -113,7 +113,7 @@ CREATE TABLE events (
     timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE cost_log (
+CREATE TABLE IF NOT EXISTS cost_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id         TEXT REFERENCES tasks(id),
     attempt_id      INTEGER REFERENCES task_attempts(id),
@@ -125,7 +125,7 @@ CREATE TABLE cost_log (
     timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE eco_log (
+CREATE TABLE IF NOT EXISTS eco_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     eco_code        TEXT NOT NULL,
     category        TEXT NOT NULL,

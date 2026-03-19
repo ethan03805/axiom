@@ -76,23 +76,23 @@ func TestDoctorChecksProjectConfigMissing(t *testing.T) {
 
 func TestDoctorChecksSecretPatternsValid(t *testing.T) {
 	d := New(DoctorConfig{
-		SensitivePatterns: []string{`\.env`, `credentials`, `sk-[a-zA-Z0-9]+`},
+		SensitivePatterns: []string{"*.env*", "*credentials*", "**/secrets/**"},
 	})
 	result := d.checkSecretPatterns()
 
 	if result.Status != StatusPass {
-		t.Errorf("valid patterns should pass: %s", result.Message)
+		t.Errorf("valid glob patterns should pass: %s", result.Message)
 	}
 }
 
 func TestDoctorChecksSecretPatternsInvalid(t *testing.T) {
 	d := New(DoctorConfig{
-		SensitivePatterns: []string{"[invalid regex"},
+		SensitivePatterns: []string{"[invalid-glob"},
 	})
 	result := d.checkSecretPatterns()
 
 	if result.Status != StatusFail {
-		t.Errorf("invalid regex should fail: %s", result.Message)
+		t.Errorf("invalid glob pattern should fail: %s", result.Message)
 	}
 }
 
@@ -102,6 +102,19 @@ func TestDoctorChecksDefaultPatterns(t *testing.T) {
 
 	if result.Status != StatusPass {
 		t.Errorf("default patterns should pass: %s", result.Message)
+	}
+}
+
+func TestDoctorChecksDefaultConfigPatterns(t *testing.T) {
+	// The default patterns from engine.DefaultConfig() are glob patterns.
+	// Verify they pass the doctor check.
+	d := New(DoctorConfig{
+		SensitivePatterns: []string{"*.env*", "*credentials*", "**/secrets/**"},
+	})
+	result := d.checkSecretPatterns()
+
+	if result.Status != StatusPass {
+		t.Errorf("default config patterns should pass validation: %s", result.Message)
 	}
 }
 
@@ -157,6 +170,20 @@ func TestDoctorChecksOpenRouterKey(t *testing.T) {
 	// The result depends on environment. Just verify it returns a valid status.
 	if result.Status != StatusPass && result.Status != StatusWarning {
 		t.Errorf("expected pass or warning, got %s", result.Status)
+	}
+}
+
+func TestDoctorChecksOpenRouterKeyFromConfig(t *testing.T) {
+	d := New(DoctorConfig{
+		OpenRouterAPIKey: "sk-or-test-key-12345",
+	})
+	result := d.checkOpenRouterKey()
+
+	if result.Status != StatusPass {
+		t.Errorf("expected pass when config key is set, got %s: %s", result.Status, result.Message)
+	}
+	if result.Name != "OpenRouter API Key" {
+		t.Errorf("name = %s", result.Name)
 	}
 }
 

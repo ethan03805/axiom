@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,10 +25,10 @@ var bitnetCmd = &cobra.Command{
 }
 
 // newBitNetServerFromConfig loads config and creates a BitNetServer instance.
-func newBitNetServerFromConfig() (*broker.BitNetServer, error) {
+func newBitNetServerFromConfig() (*broker.BitNetServer, *engine.Config, error) {
 	cfg, err := engine.LoadConfig()
 	if err != nil {
-		return nil, fmt.Errorf("load config: %w", err)
+		return nil, nil, fmt.Errorf("load config: %w", err)
 	}
 	srv := broker.NewBitNetServer(broker.BitNetServerConfig{
 		Enabled:               cfg.BitNet.Enabled,
@@ -34,8 +36,10 @@ func newBitNetServerFromConfig() (*broker.BitNetServer, error) {
 		Port:                  cfg.BitNet.Port,
 		MaxConcurrentRequests: cfg.BitNet.MaxConcurrentRequests,
 		CPUThreads:            cfg.BitNet.CPUThreads,
+		BinaryPath:            cfg.BitNet.BinaryPath,
+		ModelsDir:             cfg.BitNet.ModelsDir,
 	})
-	return srv, nil
+	return srv, cfg, nil
 }
 
 var bitnetStartCmd = &cobra.Command{
@@ -45,7 +49,7 @@ var bitnetStartCmd = &cobra.Command{
 On first run, downloads model weights if not present (with user confirmation).
 The server exposes an OpenAI-compatible API at the configured port.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		srv, err := newBitNetServerFromConfig()
+		srv, cfg, err := newBitNetServerFromConfig()
 		if err != nil {
 			return err
 		}
@@ -57,7 +61,10 @@ The server exposes an OpenAI-compatible API at the configured port.`,
 		}
 
 		if !hasWeights {
-			fmt.Print("Falcon3 1-bit model weights not found. Download? (y/n) ")
+			fmt.Println("Falcon3 1.58-bit model weights not found.")
+			fmt.Println("This will download and convert the model using the vendored BitNet framework.")
+			fmt.Println("Approximate download size: ~1.3 GB")
+			fmt.Print("Proceed? (y/n) ")
 			reader := bufio.NewReader(os.Stdin)
 			answer, err := reader.ReadString('\n')
 			if err != nil {
@@ -69,19 +76,9 @@ The server exposes an OpenAI-compatible API at the configured port.`,
 				return nil
 			}
 
-			// Set up the models directory and create a placeholder.
-			// In production this would download the actual weights.
-			fmt.Println("Downloading Falcon3 1-bit model weights...")
-			modelsDir, err := srv.SetupModelsDir()
-			if err != nil {
-				return fmt.Errorf("setup models directory: %w", err)
+			if err := downloadFalcon3Model(cfg); err != nil {
+				return fmt.Errorf("download model: %w", err)
 			}
-			// Stub: create a placeholder weight file so Start() succeeds.
-			placeholderPath := modelsDir + "/falcon3-1b.gguf"
-			if err := os.WriteFile(placeholderPath, []byte("placeholder"), 0644); err != nil {
-				return fmt.Errorf("write placeholder weights: %w", err)
-			}
-			fmt.Printf("Model weights saved to %s\n", modelsDir)
 		}
 
 		fmt.Println("Starting BitNet inference server...")
@@ -107,7 +104,7 @@ var bitnetStopCmd = &cobra.Command{
 	Use:   "stop",
 	Short: "Stop the local inference server",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		srv, err := newBitNetServerFromConfig()
+		srv, _, err := newBitNetServerFromConfig()
 		if err != nil {
 			return err
 		}
@@ -125,7 +122,7 @@ var bitnetStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show server status, resource usage, active requests",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		srv, err := newBitNetServerFromConfig()
+		srv, _, err := newBitNetServerFromConfig()
 		if err != nil {
 			return err
 		}
@@ -162,7 +159,7 @@ var bitnetModelsCmd = &cobra.Command{
 	Use:   "models",
 	Short: "List available local models",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		srv, err := newBitNetServerFromConfig()
+		srv, _, err := newBitNetServerFromConfig()
 		if err != nil {
 			return err
 		}
@@ -186,6 +183,85 @@ var bitnetModelsCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// downloadFalcon3Model uses the vendored BitNet setup_env.py to download
+// and convert the Falcon3 1.58-bit model to GGUF format.
+func downloadFalcon3Model(cfg *engine.Config) error {
+	repo := cfg.BitNet.ModelRepo
+	if repo == "" {
+		repo = "tiiuae/Falcon3-1B-Instruct-1.58bit"
+	}
+
+	// Find the vendored BitNet directory
+	bitnetDir := resolveBitNetDir()
+	if bitnetDir == "" {
+		return fmt.Errorf("vendored BitNet directory not found; ensure third_party/BitNet exists relative to the axiom binary or working directory")
+	}
+
+	setupScript := filepath.Join(bitnetDir, "setup_env.py")
+	if _, err := os.Stat(setupScript); err != nil {
+		return fmt.Errorf("BitNet setup_env.py not found at %s: %w", setupScript, err)
+	}
+
+	// Check for Python venv; if not present, create one and install deps
+	venvPython := filepath.Join(bitnetDir, ".venv", "bin", "python3")
+	if _, err := os.Stat(venvPython); err != nil {
+		fmt.Println("Setting up Python environment for BitNet...")
+		venvCmd := exec.Command("python3", "-m", "venv", filepath.Join(bitnetDir, ".venv"))
+		venvCmd.Stdout = os.Stdout
+		venvCmd.Stderr = os.Stderr
+		if err := venvCmd.Run(); err != nil {
+			return fmt.Errorf("create Python venv: %w", err)
+		}
+		pipCmd := exec.Command(filepath.Join(bitnetDir, ".venv", "bin", "pip"), "install", "-r", filepath.Join(bitnetDir, "requirements.txt"))
+		pipCmd.Dir = bitnetDir
+		pipCmd.Stdout = os.Stdout
+		pipCmd.Stderr = os.Stderr
+		if err := pipCmd.Run(); err != nil {
+			return fmt.Errorf("install BitNet requirements: %w", err)
+		}
+	}
+
+	fmt.Printf("Downloading and converting %s...\n", repo)
+	fmt.Println("This may take several minutes.")
+
+	downloadCmd := exec.Command(venvPython, "setup_env.py", "--hf-repo", repo, "-q", "i2_s")
+	downloadCmd.Dir = bitnetDir
+	downloadCmd.Stdout = os.Stdout
+	downloadCmd.Stderr = os.Stderr
+	if err := downloadCmd.Run(); err != nil {
+		return fmt.Errorf("BitNet setup_env.py failed: %w", err)
+	}
+
+	fmt.Println("Model downloaded and converted successfully.")
+	return nil
+}
+
+// resolveBitNetDir finds the vendored BitNet directory under third_party/.
+func resolveBitNetDir() string {
+	// Try relative to the axiom binary
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		candidates := []string{
+			filepath.Join(exeDir, "..", "third_party", "BitNet"),
+			filepath.Join(exeDir, "third_party", "BitNet"),
+		}
+		for _, c := range candidates {
+			if abs, err := filepath.Abs(c); err == nil {
+				if info, err := os.Stat(abs); err == nil && info.IsDir() {
+					return abs
+				}
+			}
+		}
+	}
+	// Try relative to working directory
+	if abs, err := filepath.Abs(filepath.Join("third_party", "BitNet")); err == nil {
+		if info, err := os.Stat(abs); err == nil && info.IsDir() {
+			return abs
+		}
+	}
+	return ""
 }
 
 func init() {

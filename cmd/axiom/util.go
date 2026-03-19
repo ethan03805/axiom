@@ -2,10 +2,10 @@ package main
 
 import (
 	"fmt"
-	"os/exec"
 	"runtime"
-	"strings"
 
+	"github.com/ethan03805/axiom/internal/doctor"
+	"github.com/ethan03805/axiom/internal/engine"
 	"github.com/spf13/cobra"
 )
 
@@ -29,78 +29,39 @@ var doctorCmd = &cobra.Command{
 	Short: "Check system requirements (Docker, BitNet, network, resources)",
 	Long: `Validates that all system prerequisites are met for running Axiom:
   - Docker daemon availability and version
+  - Git availability
   - BitNet server status
   - Network connectivity (OpenRouter reachability)
   - System resources (CPU, memory, disk)
   - Container images available
-  - Configuration validity`,
+  - Secret scanner regex patterns
+  - Configuration validity
+
+See Architecture Section 27.7.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Println("Axiom Doctor")
-		fmt.Println("============")
-		fmt.Println()
-
-		checks := []struct {
-			name  string
-			check func() (string, error)
-		}{
-			{"Docker", checkDocker},
-			{"Git", checkGit},
-			{"System Resources", checkResources},
-			{"Configuration", checkConfig},
+		cfg, err := engine.LoadConfig()
+		if err != nil {
+			// Use defaults if config cannot be loaded.
+			cfg = engine.DefaultConfig()
 		}
 
-		allPassed := true
-		for _, c := range checks {
-			result, err := c.check()
-			if err != nil {
-				fmt.Printf("  [FAIL] %s: %v\n", c.name, err)
-				allPassed = false
-			} else {
-				fmt.Printf("  [PASS] %s: %s\n", c.name, result)
-			}
-		}
+		projectRoot := "."
 
-		fmt.Println()
-		if allPassed {
-			fmt.Println("All checks passed. Axiom is ready to run.")
-		} else {
-			fmt.Println("Some checks failed. Please resolve the issues above.")
-		}
+		d := doctor.New(doctor.DoctorConfig{
+			BitNetHost:        cfg.BitNet.Host,
+			BitNetPort:        cfg.BitNet.Port,
+			DockerImage:       cfg.Docker.Image,
+			SensitivePatterns: cfg.Security.SensitivePatterns,
+			WarmPoolEnabled:   cfg.Validation.WarmPoolEnabled,
+			WarmPoolImage:     cfg.Docker.Image,
+			ProjectRoot:       projectRoot,
+			OpenRouterAPIKey:  cfg.OpenRouter.APIKey,
+		})
+
+		report := d.Run()
+		doctor.PrintReport(report)
 		return nil
 	},
-}
-
-func checkDocker() (string, error) {
-	out, err := exec.Command("docker", "version", "--format", "{{.Server.Version}}").Output()
-	if err != nil {
-		return "", fmt.Errorf("Docker not found or not running. Install Docker and ensure the daemon is started.")
-	}
-	return fmt.Sprintf("Docker %s", strings.TrimSpace(string(out))), nil
-}
-
-func checkGit() (string, error) {
-	out, err := exec.Command("git", "--version").Output()
-	if err != nil {
-		return "", fmt.Errorf("Git not found. Install git.")
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-func checkResources() (string, error) {
-	cpus := runtime.NumCPU()
-	if cpus < 2 {
-		return "", fmt.Errorf("at least 2 CPUs recommended, found %d", cpus)
-	}
-	return fmt.Sprintf("%d CPUs available", cpus), nil
-}
-
-func checkConfig() (string, error) {
-	// Check if .axiom/config.toml exists.
-	_, err := exec.Command("test", "-f", ".axiom/config.toml").Output()
-	if err != nil {
-		return "No project config (run 'axiom init' first)", nil
-	}
-	return "Project config found", nil
 }
 
 // --- axiom config ---
@@ -116,10 +77,28 @@ var configCmd = &cobra.Command{
 var configReloadCmd = &cobra.Command{
 	Use:   "reload",
 	Short: "Reload configuration without engine restart",
-	Long:  `Reloads API keys and other settings from config files without requiring an engine restart.`,
+	Long: `Reloads API keys and other settings from config files without requiring
+an engine restart. Reads both global (~/.axiom/config.toml) and project
+(.axiom/config.toml) configuration files, validates them, and reports
+the active settings.
+
+See Architecture Section 19.5 (Credential Management).`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Reloading configuration...")
-		fmt.Println("Configuration reloaded.")
+
+		cfg, err := engine.LoadConfig()
+		if err != nil {
+			return fmt.Errorf("reload config: %w", err)
+		}
+
+		fmt.Println("Configuration reloaded successfully.")
+		fmt.Printf("  Project:       %s\n", cfg.Project.Name)
+		fmt.Printf("  Budget:        $%.2f\n", cfg.Budget.MaxUSD)
+		fmt.Printf("  Max Meeseeks:  %d\n", cfg.Concurrency.MaxMeeseeks)
+		fmt.Printf("  Runtime:       %s\n", cfg.Orchestrator.Runtime)
+		fmt.Printf("  Docker Image:  %s\n", cfg.Docker.Image)
+		fmt.Printf("  BitNet:        %v (port %d)\n", cfg.BitNet.Enabled, cfg.BitNet.Port)
+		fmt.Printf("  API Port:      %d\n", cfg.API.Port)
 		return nil
 	},
 }

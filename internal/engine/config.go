@@ -48,12 +48,17 @@ type OrchestratorConfig struct {
 }
 
 // BitNetConfig controls the local BitNet model server.
+// BinaryPath and ModelsDir allow overriding the packaged defaults.
+// When empty, Axiom resolves these relative to the axiom binary location.
 type BitNetConfig struct {
 	Enabled               bool   `toml:"enabled"`
 	Host                  string `toml:"host"`
 	Port                  int    `toml:"port"`
 	MaxConcurrentRequests int    `toml:"max_concurrent_requests"`
 	CPUThreads            int    `toml:"cpu_threads"`
+	BinaryPath            string `toml:"binary_path"` // Path to llama-server binary (default: vendor/BitNet/build/bin/llama-server relative to axiom binary)
+	ModelsDir             string `toml:"models_dir"`  // Path to model weights directory (default: ~/.axiom/bitnet/models/)
+	ModelRepo             string `toml:"model_repo"`  // HuggingFace repo for model download (default: tiiuae/Falcon3-1B-Instruct-1.58bit)
 }
 
 // DockerConfig holds container runtime settings.

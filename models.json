@@ -17,7 +17,7 @@
       "not_recommended_for": ["simple-implementations", "config-changes", "formatting"]
     },
     {
-      "id": "anthropic/claude-haiku-4",
+      "id": "anthropic/claude-haiku-4.5",
       "strengths": ["fast", "cheap", "simple-functions", "straightforward-implementations"],
       "weaknesses": ["limited-reasoning", "struggles-with-complex-logic", "poor-architectural-decisions"],
       "recommended_for": ["simple-functions", "small-modifications", "test-stubs", "boilerplate"],

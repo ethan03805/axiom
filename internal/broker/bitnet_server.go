@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -62,6 +63,9 @@ func NewBitNetServer(config BitNetServerConfig) *BitNetServer {
 
 // Start launches the BitNet server process.
 // If model weights are not present, returns an error indicating first-run setup is needed.
+// When the vendored BitNet directory is available, the server is started via
+// run_inference_server.py which handles correct initialization of the 1.58-bit
+// kernels. Direct binary invocation is used as a fallback when Python is unavailable.
 // See Architecture Section 19.10.
 func (s *BitNetServer) Start() error {
 	s.mu.Lock()
@@ -83,28 +87,109 @@ func (s *BitNetServer) Start() error {
 		}
 	}
 
-	// Build the server command.
-	// In production, this invokes bitnet.cpp with the appropriate flags.
-	// The server exposes an OpenAI-compatible API at the configured port.
+	// Find the model file.
+	modelPath := s.ResolveModelPath()
+	if modelPath == "" {
+		return fmt.Errorf("no model file found in %s or vendored BitNet directory", s.config.ModelsDir)
+	}
+
+	bitnetDir := s.resolveBitNetDir()
+
+	// Prefer the Python wrapper (run_inference_server.py) for reliable startup.
+	// The wrapper handles correct initialization of the 1.58-bit kernels and
+	// ensures proper library loading. Direct binary invocation crashes during
+	// inference with the custom kernel builds.
+	if bitnetDir != "" {
+		if err := s.startViaPythonWrapper(bitnetDir, modelPath); err == nil {
+			return nil
+		}
+		// Fall through to direct binary invocation if Python wrapper fails.
+		fmt.Fprintf(os.Stderr, "warning: Python wrapper unavailable, falling back to direct binary invocation\n")
+	}
+
+	// Fallback: direct binary invocation.
+	if err := s.startDirectBinary(bitnetDir, modelPath); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// startViaPythonWrapper starts the BitNet server using run_inference_server.py.
+// This is the preferred method as it handles correct initialization of the
+// 1.58-bit kernels that the direct binary invocation fails to do properly.
+func (s *BitNetServer) startViaPythonWrapper(bitnetDir, modelPath string) error {
+	wrapperScript := filepath.Join(bitnetDir, "run_inference_server.py")
+	if _, err := os.Stat(wrapperScript); err != nil {
+		return fmt.Errorf("run_inference_server.py not found: %w", err)
+	}
+
+	// Find Python in the BitNet venv, fall back to system python3.
+	pythonPath := filepath.Join(bitnetDir, ".venv", "bin", "python3")
+	if _, err := os.Stat(pythonPath); err != nil {
+		pythonPath = "python3"
+		if _, err := exec.LookPath(pythonPath); err != nil {
+			return fmt.Errorf("python3 not found")
+		}
+	}
+
+	// Make the model path relative to bitnetDir if it's inside it,
+	// since run_inference_server.py runs from the BitNet directory.
+	relModelPath := modelPath
+	if rel, err := filepath.Rel(bitnetDir, modelPath); err == nil && !strings.HasPrefix(rel, "..") {
+		relModelPath = rel
+	}
+
+	args := []string{
+		"run_inference_server.py",
+		"-m", relModelPath,
+		"-t", fmt.Sprintf("%d", s.config.CPUThreads),
+		"-c", "2048",
+		"-n", "4096",
+		"--host", s.config.Host,
+		"--port", fmt.Sprintf("%d", s.config.Port),
+	}
+
+	s.cmd = exec.Command(pythonPath, args...)
+	s.cmd.Dir = bitnetDir
+	s.cmd.Stdout = os.Stdout
+	s.cmd.Stderr = os.Stderr
+
+	if err := s.cmd.Start(); err != nil {
+		return fmt.Errorf("start BitNet server via Python wrapper: %w", err)
+	}
+
+	s.running = true
+	s.startedAt = time.Now()
+
+	if err := s.waitForReady(30 * time.Second); err != nil {
+		s.Stop()
+		return fmt.Errorf("BitNet server (Python wrapper) failed to become ready: %w", err)
+	}
+
+	return nil
+}
+
+// startDirectBinary starts the BitNet server by invoking llama-server directly.
+// This is a fallback when the Python wrapper is unavailable.
+func (s *BitNetServer) startDirectBinary(bitnetDir, modelPath string) error {
 	args := []string{
 		"--host", s.config.Host,
 		"--port", fmt.Sprintf("%d", s.config.Port),
 		"--threads", fmt.Sprintf("%d", s.config.CPUThreads),
-		"--ctx-size", "4096",
+		"--ctx-size", "2048",
+		"--model", modelPath,
+		"-ngl", "0",
+		"-n", "4096",
+		"-cb",
 	}
 
-	// Find the model file.
-	modelPath := s.findModelPath()
-	if modelPath != "" {
-		args = append(args, "--model", modelPath)
-	}
-
-	binaryPath := s.config.BinaryPath
-	if binaryPath == "" {
-		binaryPath = "bitnet-server" // Assume on PATH
-	}
+	binaryPath := s.resolveBinaryPath()
 
 	s.cmd = exec.Command(binaryPath, args...)
+	if bitnetDir != "" {
+		s.cmd.Dir = bitnetDir
+	}
 	s.cmd.Stdout = os.Stdout
 	s.cmd.Stderr = os.Stderr
 
@@ -115,8 +200,7 @@ func (s *BitNetServer) Start() error {
 	s.running = true
 	s.startedAt = time.Now()
 
-	// Wait for server to be ready.
-	if err := s.waitForReady(10 * time.Second); err != nil {
+	if err := s.waitForReady(30 * time.Second); err != nil {
 		s.Stop()
 		return fmt.Errorf("BitNet server failed to become ready: %w", err)
 	}
@@ -305,16 +389,21 @@ func (s *BitNetServer) GetConfig() BitNetServerConfig {
 	return s.config
 }
 
-// hasModelWeights checks if any model weight files exist in the models directory.
+// hasModelWeights checks if any model weight files exist in the models directory
+// or in the vendored BitNet models directory.
 func (s *BitNetServer) hasModelWeights() bool {
+	// Check user models dir
 	entries, err := os.ReadDir(s.config.ModelsDir)
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		if !e.IsDir() && (filepath.Ext(e.Name()) == ".gguf" || filepath.Ext(e.Name()) == ".bin") {
-			return true
+	if err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && (filepath.Ext(e.Name()) == ".gguf" || filepath.Ext(e.Name()) == ".bin") {
+				return true
+			}
 		}
+	}
+	// Check vendored model path
+	if p := s.ResolveModelPath(); p != "" {
+		return true
 	}
 	return false
 }
@@ -373,6 +462,122 @@ func (s *BitNetServer) UntrackRequest() {
 		s.activeReq--
 	}
 	s.mu.Unlock()
+}
+
+// resolveBinaryPath determines the path to the llama-server binary packaged
+// with BitNet. Resolution order:
+//  1. Explicit BinaryPath in config (user override)
+//  2. vendor/BitNet/build/bin/llama-server relative to the axiom binary
+//  3. vendor/BitNet/build/bin/llama-server relative to the working directory
+//  4. "llama-server" on PATH (fallback for system-installed llama.cpp)
+func (s *BitNetServer) resolveBinaryPath() string {
+	// 1. Explicit config override
+	if s.config.BinaryPath != "" {
+		return s.config.BinaryPath
+	}
+
+	// 2. Relative to the axiom binary itself
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		// The axiom binary lives in bin/ or at the project root.
+		// Try going up from bin/ to find vendor/BitNet/
+		candidates := []string{
+			filepath.Join(exeDir, "..", "third_party", "BitNet", "build", "bin", "llama-server"),
+			filepath.Join(exeDir, "third_party", "BitNet", "build", "bin", "llama-server"),
+		}
+		for _, c := range candidates {
+			if resolved, err := filepath.Abs(c); err == nil {
+				if _, err := os.Stat(resolved); err == nil {
+					return resolved
+				}
+			}
+		}
+	}
+
+	// 3. Relative to working directory
+	candidates := []string{
+		filepath.Join("third_party", "BitNet", "build", "bin", "llama-server"),
+	}
+	for _, c := range candidates {
+		if resolved, err := filepath.Abs(c); err == nil {
+			if _, err := os.Stat(resolved); err == nil {
+				return resolved
+			}
+		}
+	}
+
+	// 4. Fallback: try llama-server on PATH (system install via brew, etc.)
+	if p, err := exec.LookPath("llama-server"); err == nil {
+		return p
+	}
+
+	// Last resort: return the name and let exec.Command fail with a clear error
+	return "llama-server"
+}
+
+// resolveBitNetDir finds the root of the third_party/BitNet directory.
+func (s *BitNetServer) resolveBitNetDir() string {
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		candidates := []string{
+			filepath.Join(exeDir, "..", "third_party", "BitNet"),
+			filepath.Join(exeDir, "third_party", "BitNet"),
+		}
+		for _, c := range candidates {
+			if abs, err := filepath.Abs(c); err == nil {
+				if info, err := os.Stat(abs); err == nil && info.IsDir() {
+					return abs
+				}
+			}
+		}
+	}
+	if abs, err := filepath.Abs(filepath.Join("third_party", "BitNet")); err == nil {
+		if info, err := os.Stat(abs); err == nil && info.IsDir() {
+			return abs
+		}
+	}
+	return ""
+}
+
+// ResolveModelPath returns the path to the GGUF model file to use.
+// It checks the configured ModelsDir first, then the vendored model directory.
+func (s *BitNetServer) ResolveModelPath() string {
+	// Check user models dir first
+	if p := s.findModelPath(); p != "" {
+		return p
+	}
+
+	// Check vendored model directory
+	vendoredPaths := []string{}
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		vendoredPaths = append(vendoredPaths,
+			filepath.Join(exeDir, "..", "third_party", "BitNet", "models"),
+			filepath.Join(exeDir, "third_party", "BitNet", "models"),
+		)
+	}
+	vendoredPaths = append(vendoredPaths, filepath.Join("third_party", "BitNet", "models"))
+
+	for _, base := range vendoredPaths {
+		if abs, err := filepath.Abs(base); err == nil {
+			if entries, err := os.ReadDir(abs); err == nil {
+				for _, d := range entries {
+					if d.IsDir() && strings.Contains(strings.ToLower(d.Name()), "falcon") {
+						modelDir := filepath.Join(abs, d.Name())
+						if files, err := os.ReadDir(modelDir); err == nil {
+							for _, f := range files {
+								if !f.IsDir() && strings.HasSuffix(f.Name(), ".gguf") && strings.Contains(f.Name(), "i2_s") {
+									return filepath.Join(modelDir, f.Name())
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return ""
 }
 
 // GrammarForJSON returns a GBNF grammar that constrains output to valid JSON.
