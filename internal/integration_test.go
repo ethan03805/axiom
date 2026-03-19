@@ -204,9 +204,6 @@ func TestIPCRoundTrip(t *testing.T) {
 // --- 22.2: Approval pipeline end-to-end ---
 
 func TestPipelineEndToEnd(t *testing.T) {
-	env := setupEnv(t)
-	_ = env
-
 	// Create staging dir with valid output.
 	stagingDir := t.TempDir()
 	os.MkdirAll(filepath.Join(stagingDir, "src"), 0755)
@@ -426,7 +423,6 @@ func TestMergeQueueSerialization(t *testing.T) {
 	gitInit(t, repoDir)
 	gitCommitEmpty(t, repoDir, "initial commit")
 
-	_ = setupEnv(t)
 	emitter := events.NewEmitter()
 
 	// Get HEAD SHA for base snapshot.
@@ -1211,9 +1207,4 @@ func newTestGitManager(repoDir string) *git.Manager {
 
 func contains(s, substr string) bool {
 	return strings.Contains(s, substr)
-}
-
-// sprintf wraps stdstdfmt.Sprintf for convenience.
-func sprintf(format string, a ...interface{}) string {
-	return stdfmt.Sprintf(format, a...)
 }
