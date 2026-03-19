@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -168,7 +169,8 @@ func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := extractBearerToken(r)
 		if token != "" && !s.limiter.Allow(token) {
-			w.Header().Set("Retry-After", "60")
+			retryAfter := s.limiter.SecondsUntilReset(token)
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
 			return
 		}

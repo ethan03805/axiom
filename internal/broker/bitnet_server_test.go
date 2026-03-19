@@ -191,6 +191,167 @@ func TestBitNetRequestTracking(t *testing.T) {
 	}
 }
 
+func TestBitNetServerEnsureWeightsNoDir(t *testing.T) {
+	srv := NewBitNetServer(BitNetServerConfig{
+		Enabled:   true,
+		ModelsDir: "/nonexistent/path/that/does/not/exist",
+	})
+
+	exists, err := srv.EnsureWeights()
+	if err != nil {
+		t.Fatalf("unexpected error for nonexistent dir: %v", err)
+	}
+	if exists {
+		t.Error("expected false for nonexistent directory")
+	}
+}
+
+func TestBitNetServerEnsureWeightsEmpty(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "axiom-bitnet-ew-*")
+	defer os.RemoveAll(tmpDir)
+
+	modelsDir := filepath.Join(tmpDir, "models")
+	os.MkdirAll(modelsDir, 0755)
+
+	srv := NewBitNetServer(BitNetServerConfig{
+		Enabled:   true,
+		ModelsDir: modelsDir,
+	})
+
+	exists, err := srv.EnsureWeights()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exists {
+		t.Error("expected false for empty models directory")
+	}
+}
+
+func TestBitNetServerEnsureWeightsPresent(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "axiom-bitnet-ew-*")
+	defer os.RemoveAll(tmpDir)
+
+	modelsDir := filepath.Join(tmpDir, "models")
+	os.MkdirAll(modelsDir, 0755)
+	os.WriteFile(filepath.Join(modelsDir, "falcon3-1b.gguf"), []byte("fake"), 0644)
+
+	srv := NewBitNetServer(BitNetServerConfig{
+		Enabled:   true,
+		ModelsDir: modelsDir,
+	})
+
+	exists, err := srv.EnsureWeights()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exists {
+		t.Error("expected true when .gguf file is present")
+	}
+}
+
+func TestBitNetServerListModels(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "axiom-bitnet-lm-*")
+	defer os.RemoveAll(tmpDir)
+
+	modelsDir := filepath.Join(tmpDir, "models")
+	os.MkdirAll(modelsDir, 0755)
+
+	srv := NewBitNetServer(BitNetServerConfig{
+		Enabled:   true,
+		ModelsDir: modelsDir,
+	})
+
+	// Empty directory.
+	models, err := srv.ListModels()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(models) != 0 {
+		t.Errorf("expected 0 models, got %d", len(models))
+	}
+
+	// Add some files.
+	os.WriteFile(filepath.Join(modelsDir, "falcon3-1b.gguf"), []byte("fake"), 0644)
+	os.WriteFile(filepath.Join(modelsDir, "other-model.bin"), []byte("fake"), 0644)
+	os.WriteFile(filepath.Join(modelsDir, "readme.txt"), []byte("not a model"), 0644)
+
+	models, err = srv.ListModels()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(models) != 2 {
+		t.Errorf("expected 2 models, got %d: %v", len(models), models)
+	}
+}
+
+func TestBitNetServerListModelsNoDir(t *testing.T) {
+	srv := NewBitNetServer(BitNetServerConfig{
+		Enabled:   true,
+		ModelsDir: "/nonexistent/path/that/does/not/exist",
+	})
+
+	models, err := srv.ListModels()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if models != nil {
+		t.Errorf("expected nil for nonexistent dir, got %v", models)
+	}
+}
+
+func TestBitNetServerGetModelsDir(t *testing.T) {
+	srv := NewBitNetServer(BitNetServerConfig{
+		Enabled:   true,
+		ModelsDir: "/custom/models/path",
+	})
+
+	if srv.GetModelsDir() != "/custom/models/path" {
+		t.Errorf("GetModelsDir = %s, want /custom/models/path", srv.GetModelsDir())
+	}
+}
+
+func TestBitNetServerGetConfig(t *testing.T) {
+	srv := NewBitNetServer(BitNetServerConfig{
+		Enabled:    true,
+		Host:       "0.0.0.0",
+		Port:       9999,
+		CPUThreads: 16,
+	})
+
+	cfg := srv.GetConfig()
+	if cfg.Host != "0.0.0.0" {
+		t.Errorf("config host = %s, want 0.0.0.0", cfg.Host)
+	}
+	if cfg.Port != 9999 {
+		t.Errorf("config port = %d, want 9999", cfg.Port)
+	}
+	if cfg.CPUThreads != 16 {
+		t.Errorf("config threads = %d, want 16", cfg.CPUThreads)
+	}
+}
+
+func TestBitNetServerStartErrorMessage(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "axiom-bitnet-msg-*")
+	defer os.RemoveAll(tmpDir)
+
+	srv := NewBitNetServer(BitNetServerConfig{
+		Enabled:   true,
+		ModelsDir: filepath.Join(tmpDir, "models"),
+	})
+
+	err := srv.Start()
+	if err == nil {
+		t.Fatal("expected error for missing weights")
+	}
+	if !NeedsFirstRun(err) {
+		t.Fatalf("expected FirstRunError, got: %v", err)
+	}
+	expected := "Model weights not found. Run 'axiom bitnet start' interactively to download."
+	if err.Error() != expected {
+		t.Errorf("error message = %q, want %q", err.Error(), expected)
+	}
+}
+
 func TestCheckOverload(t *testing.T) {
 	// 4 BitNet threads + 6 container CPUs on 8 total = 10/8 = 125% > 90%
 	if !CheckOverload(4, 6, 8) {

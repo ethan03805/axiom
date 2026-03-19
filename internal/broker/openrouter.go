@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -58,6 +59,87 @@ func (c *OpenRouterClient) Available(_ context.Context) bool {
 	return c.apiKey != ""
 }
 
+// maxRetries is the maximum number of retry attempts for transient errors.
+const maxRetries = 3
+
+// retryBackoffs defines the exponential backoff durations for each retry attempt.
+var retryBackoffs = [maxRetries]time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+
+// isRetryable returns true if the HTTP status code warrants a retry.
+// Only 429 (rate limit) and 5xx (server error) responses are retried.
+// Other 4xx errors are NOT retried as they indicate client-side issues.
+func isRetryable(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests || statusCode >= 500
+}
+
+// retryDelay computes the delay before the next retry attempt. If the response
+// includes a Retry-After header (typically on 429 responses), that value is
+// used instead of the default exponential backoff.
+func retryDelay(resp *http.Response, attempt int) time.Duration {
+	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+		if ra := resp.Header.Get("Retry-After"); ra != "" {
+			if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+				return time.Duration(secs) * time.Second
+			}
+		}
+	}
+	return retryBackoffs[attempt]
+}
+
+// doWithRetry executes an HTTP request with retry logic for transient errors.
+// It retries on 429 (rate limit) and 5xx (server error) responses up to
+// maxRetries times with exponential backoff (1s, 2s, 4s). The Retry-After
+// header is honoured on 429 responses. Non-retryable 4xx errors are returned
+// immediately.
+//
+// The buildReq function is called for every attempt so that the request body
+// reader is fresh (http.Request bodies are consumed on send).
+func (c *OpenRouterClient) doWithRetry(ctx context.Context, buildReq func() (*http.Request, error)) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		httpReq, err := buildReq()
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			lastErr = fmt.Errorf("http request: %w", err)
+			// Network errors are transient; sleep and retry.
+			if attempt < maxRetries {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(retryBackoffs[attempt]):
+				}
+			}
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+
+		// Read the error body for the error message.
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		lastErr = fmt.Errorf("openrouter error %d: %s", resp.StatusCode, string(bodyBytes))
+
+		if !isRetryable(resp.StatusCode) || attempt == maxRetries {
+			return nil, lastErr
+		}
+
+		// Wait before retrying with exponential backoff or Retry-After.
+		delay := retryDelay(resp, attempt)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return nil, lastErr
+}
+
 // Complete sends a non-streaming completion request to OpenRouter.
 func (c *OpenRouterClient) Complete(ctx context.Context, req *InferenceRequest) (*InferenceResponse, error) {
 	body := c.buildRequestBody(req, false)
@@ -66,24 +148,22 @@ func (c *OpenRouterClient) Complete(ctx context.Context, req *InferenceRequest) 
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		c.baseURL+"/chat/completions", bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+	buildReq := func() (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST",
+			c.baseURL+"/chat/completions", bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+		return httpReq, nil
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.doWithRetry(ctx, buildReq)
 	if err != nil {
-		return nil, fmt.Errorf("http request: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("openrouter error %d: %s", resp.StatusCode, string(bodyBytes))
-	}
 
 	return c.parseResponse(resp.Body, req.ModelID)
 }
@@ -98,24 +178,22 @@ func (c *OpenRouterClient) CompleteStream(ctx context.Context, req *InferenceReq
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		c.baseURL+"/chat/completions", bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+	buildReq := func() (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST",
+			c.baseURL+"/chat/completions", bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+		return httpReq, nil
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.doWithRetry(ctx, buildReq)
 	if err != nil {
-		return nil, fmt.Errorf("http request: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("openrouter error %d: %s", resp.StatusCode, string(bodyBytes))
-	}
 
 	return parseSSEStream(resp.Body, req.ModelID, onChunk)
 }

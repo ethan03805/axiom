@@ -79,7 +79,7 @@ func (s *BitNetServer) Start() error {
 	if !s.hasModelWeights() {
 		return &FirstRunError{
 			ModelsDir: s.config.ModelsDir,
-			Message:   "No model weights found. Run 'axiom bitnet start' to download Falcon3 1-bit weights.",
+			Message:   "Model weights not found. Run 'axiom bitnet start' interactively to download.",
 		}
 	}
 
@@ -252,6 +252,57 @@ func (s *BitNetServer) SetupModelsDir() (string, error) {
 		return "", fmt.Errorf("create models dir: %w", err)
 	}
 	return s.config.ModelsDir, nil
+}
+
+// EnsureWeights checks if model weight files exist in the models directory.
+// Returns (true, nil) if weights are present, (false, nil) if absent,
+// or (false, error) on filesystem errors.
+// See Architecture Section 19.9.
+func (s *BitNetServer) EnsureWeights() (bool, error) {
+	entries, err := os.ReadDir(s.config.ModelsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read models dir: %w", err)
+	}
+	for _, e := range entries {
+		ext := filepath.Ext(e.Name())
+		if !e.IsDir() && (ext == ".gguf" || ext == ".bin") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ListModels returns a list of model file names found in the models directory.
+// Returns only .gguf and .bin files.
+func (s *BitNetServer) ListModels() ([]string, error) {
+	entries, err := os.ReadDir(s.config.ModelsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read models dir: %w", err)
+	}
+	var models []string
+	for _, e := range entries {
+		ext := filepath.Ext(e.Name())
+		if !e.IsDir() && (ext == ".gguf" || ext == ".bin") {
+			models = append(models, e.Name())
+		}
+	}
+	return models, nil
+}
+
+// GetModelsDir returns the configured models directory path.
+func (s *BitNetServer) GetModelsDir() string {
+	return s.config.ModelsDir
+}
+
+// GetConfig returns the server configuration.
+func (s *BitNetServer) GetConfig() BitNetServerConfig {
+	return s.config
 }
 
 // hasModelWeights checks if any model weight files exist in the models directory.

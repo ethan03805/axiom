@@ -69,3 +69,20 @@ func (rl *RateLimiter) RequestsRemaining(token string) int {
 	}
 	return remaining
 }
+
+// SecondsUntilReset returns the number of seconds until the rate limit window
+// resets for the given token. Returns 60 as a fallback if no bucket exists.
+func (rl *RateLimiter) SecondsUntilReset(token string) int {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	bucket, exists := rl.buckets[token]
+	if !exists {
+		return 60
+	}
+	secs := int(time.Until(bucket.resetAt).Seconds())
+	if secs < 1 {
+		return 1
+	}
+	return secs
+}
