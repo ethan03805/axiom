@@ -56,8 +56,9 @@ func (h *ScopeExpansionHandler) HandleScopeExpansion(taskID string, msg interfac
 		}
 	}
 
-	// Check if all additional locks are available.
-	allAvailable, blockedBy, err := h.db.CheckAllLocksAvailable(lockReqs)
+	// Check if all additional locks are available. Pass the requesting task ID
+	// so self-held locks are not treated as conflicts.
+	allAvailable, blockedBy, err := h.db.CheckAllLocksAvailable(lockReqs, taskID)
 	if err != nil {
 		return &ipc.ScopeExpansionResponseMessage{
 			Header:  ipc.Header{Type: ipc.TypeScopeExpansionResponse, TaskID: taskID},

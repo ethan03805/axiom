@@ -91,15 +91,17 @@ func TestGetDispatchableRespectsLocks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get dispatchable: %v", err)
 	}
-	// Only t1... wait, t1 already has the lock. But t1 is queued.
-	// Actually, t1's lock is already held by t1 itself. The GetDispatchable
-	// checks lock availability for tasks that haven't been dispatched yet.
-	// Since t1 holds the lock, t2 can't get it. And t1 already holds its own
-	// lock which means CheckAllLocksAvailable returns false for t1 too.
-	// This is correct behavior: if a task already has locks (from a previous
-	// dispatch), it shouldn't be in queued state.
+	// t1 holds its own lock on main.go. CheckAllLocksAvailable is now task-aware:
+	// self-held locks are treated as available so a re-queued task can be
+	// re-dispatched (BUG-043 fix). t2 is blocked by t1's lock on main.go.
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 dispatchable (t1 with self-held lock), got %d", len(tasks))
+	}
+	if tasks[0].Task.ID != "t1" {
+		t.Errorf("expected t1 to be dispatchable with self-held lock, got %s", tasks[0].Task.ID)
+	}
 
-	// Let's redo: t1 has no target files (no lock needed), t2 targets main.go.
+	// Now test that a lock held by a DIFFERENT task blocks correctly.
 	// Lock main.go to a different task (t3).
 	db.ReleaseLocks("t1")
 	db.CreateTask(&state.Task{ID: "t3", Title: "Task 3", Status: "in_progress", Tier: "standard", TaskType: "implementation"})

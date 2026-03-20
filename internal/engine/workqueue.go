@@ -84,13 +84,15 @@ func (wq *WorkQueue) GetDispatchable() ([]*DispatchableTask, error) {
 			continue
 		}
 
-		// Check if all locks are available.
-		allAvailable, _, err := wq.db.CheckAllLocksAvailable(locks)
+		// Check if all locks are available. Pass the task ID so that
+		// stale self-held locks (from a prior failed attempt) are treated
+		// as available rather than blocking the task forever.
+		allAvailable, _, err := wq.db.CheckAllLocksAvailable(locks, task.ID)
 		if err != nil {
 			continue
 		}
 		if !allAvailable {
-			continue // Skip tasks with lock conflicts
+			continue // Skip tasks with lock conflicts from other tasks
 		}
 
 		dispatchable = append(dispatchable, &DispatchableTask{
@@ -106,8 +108,18 @@ func (wq *WorkQueue) GetDispatchable() ([]*DispatchableTask, error) {
 // it to in_progress. This is atomic: if lock acquisition fails (race with
 // another dispatch), the task remains queued.
 //
+// If the task already holds stale locks from a previous failed attempt,
+// those are released before re-acquiring to prevent self-deadlock.
+//
 // Returns true if the task was successfully dispatched.
 func (wq *WorkQueue) AcquireAndDispatch(taskID string, locks []state.LockRequest) (bool, error) {
+	// Release any stale locks this task may still hold from a prior attempt.
+	// This handles the case where requeueTask's FailTask call failed to
+	// release locks (BUG-043).
+	if len(locks) > 0 {
+		_ = wq.db.ReleaseLocks(taskID)
+	}
+
 	// Try to acquire locks atomically.
 	if len(locks) > 0 {
 		if err := wq.db.AcquireLocks(taskID, locks); err != nil {

@@ -896,7 +896,17 @@ func (c *Coordinator) requeueTask(taskID string) {
 				"error": fmt.Sprintf("requeueTask: get task: %v", err),
 			},
 		})
-		_ = c.workQueue.FailTask(taskID)
+		if failErr := c.workQueue.FailTask(taskID); failErr != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: taskID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("requeueTask: FailTask error (forcing lock release): %v", failErr),
+				},
+			})
+			// Force lock release as a safety net so stale locks don't block the pipeline.
+			_ = c.db.ReleaseLocks(taskID)
+		}
 		_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusFailed)
 		_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusBlocked)
 		return
@@ -908,7 +918,17 @@ func (c *Coordinator) requeueTask(taskID string) {
 
 	// If we haven't exhausted retries at the current tier, just requeue.
 	if tierAttempts < maxRetriesPerTier {
-		_ = c.workQueue.FailTask(taskID)
+		if failErr := c.workQueue.FailTask(taskID); failErr != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: taskID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("requeueTask: FailTask error (forcing lock release): %v", failErr),
+				},
+			})
+			// Force lock release as a safety net so stale locks don't block the pipeline.
+			_ = c.db.ReleaseLocks(taskID)
+		}
 		_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusFailed)
 		_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusQueued)
 		return
@@ -954,7 +974,16 @@ func (c *Coordinator) requeueTask(taskID string) {
 				"escalation_num":  escalationsDone + 1,
 			},
 		})
-		_ = c.workQueue.FailTask(taskID)
+		if failErr := c.workQueue.FailTask(taskID); failErr != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: taskID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("requeueTask escalation: FailTask error (forcing lock release): %v", failErr),
+				},
+			})
+			_ = c.db.ReleaseLocks(taskID)
+		}
 		_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusFailed)
 		_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusQueued)
 		return
@@ -970,7 +999,16 @@ func (c *Coordinator) requeueTask(taskID string) {
 			"final_tier":     task.Tier,
 		},
 	})
-	_ = c.workQueue.FailTask(taskID)
+	if failErr := c.workQueue.FailTask(taskID); failErr != nil {
+		c.emitter.Emit(events.Event{
+			Type:   events.EventTaskFailed,
+			TaskID: taskID,
+			Details: map[string]interface{}{
+				"error": fmt.Sprintf("requeueTask blocked: FailTask error (forcing lock release): %v", failErr),
+			},
+		})
+		_ = c.db.ReleaseLocks(taskID)
+	}
 	_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusFailed)
 	_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusBlocked)
 }

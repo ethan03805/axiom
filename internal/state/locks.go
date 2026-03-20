@@ -38,6 +38,9 @@ func (db *DB) AcquireLocks(taskID string, locks []LockRequest) error {
 		return sorted[i].ResourceType < sorted[j].ResourceType
 	})
 
+	db.wmu.Lock()
+	defer db.wmu.Unlock()
+
 	tx, err := db.conn.Begin()
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -75,6 +78,8 @@ func (db *DB) AcquireLocks(taskID string, locks []LockRequest) error {
 
 // ReleaseLocks releases all locks held by the given task.
 func (db *DB) ReleaseLocks(taskID string) error {
+	db.wmu.Lock()
+	defer db.wmu.Unlock()
 	_, err := db.conn.Exec("DELETE FROM task_locks WHERE task_id = ?", taskID)
 	if err != nil {
 		return fmt.Errorf("release locks: %w", err)
@@ -103,16 +108,19 @@ func (db *DB) GetLockedResources() ([]Lock, error) {
 	return locks, rows.Err()
 }
 
-// CheckAllLocksAvailable checks if ALL the requested locks can be acquired.
-// Returns true if all are available, false if any are held.
+// CheckAllLocksAvailable checks if ALL the requested locks can be acquired
+// by the given task. Locks already held by requestingTaskID are treated as
+// available (the task can re-acquire its own locks). This prevents stale
+// self-held locks from permanently blocking a re-queued task.
+// Returns true if all are available, false if any are held by another task.
 // If unavailable, returns the task ID holding the first conflicting lock.
-func (db *DB) CheckAllLocksAvailable(locks []LockRequest) (bool, string, error) {
+func (db *DB) CheckAllLocksAvailable(locks []LockRequest, requestingTaskID string) (bool, string, error) {
 	for _, lock := range locks {
 		locked, holder, err := db.IsLocked(lock.ResourceType, lock.ResourceKey)
 		if err != nil {
 			return false, "", err
 		}
-		if locked {
+		if locked && holder != requestingTaskID {
 			return false, holder, nil
 		}
 	}

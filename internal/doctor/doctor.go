@@ -5,7 +5,9 @@
 package doctor
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -305,8 +307,13 @@ func (d *Doctor) checkSecretPatterns() CheckResult {
 	}
 }
 
-// checkBitNet performs a direct HTTP GET to localhost:3002/v1/models to
-// verify the BitNet local inference server is reachable.
+// checkBitNet verifies that the BitNet server can actually perform inference,
+// not just respond to health checks. The /v1/models endpoint is checked by
+// checkBitNetServer; this check sends a minimal chat completion request to
+// verify the model can generate tokens.
+//
+// This addresses BUG-044: the previous check only hit /v1/models, which works
+// even when the server crashes with SIGSEGV on real inference requests.
 // See Architecture Section 27.7.
 func (d *Doctor) checkBitNet() CheckResult {
 	host := d.config.BitNetHost
@@ -318,30 +325,84 @@ func (d *Doctor) checkBitNet() CheckResult {
 		port = 3002
 	}
 
-	url := fmt.Sprintf("http://%s:%d/v1/models", host, port)
+	modelsURL := fmt.Sprintf("http://%s:%d/v1/models", host, port)
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(url)
+
+	// First check: is the server reachable at all?
+	resp, err := client.Get(modelsURL)
 	if err != nil {
 		return CheckResult{
 			Name:    "BitNet Local Inference",
 			Status:  StatusWarning,
-			Message: fmt.Sprintf("BitNet server not reachable at %s (local inference unavailable)", url),
+			Message: fmt.Sprintf("BitNet server not reachable at %s (local inference unavailable)", modelsURL),
 		}
 	}
 	resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
+	if resp.StatusCode != http.StatusOK {
 		return CheckResult{
 			Name:    "BitNet Local Inference",
-			Status:  StatusPass,
-			Message: fmt.Sprintf("BitNet server responding at %s:%d", host, port),
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("BitNet server returned status %d at %s", resp.StatusCode, modelsURL),
+		}
+	}
+
+	// Second check: send a minimal inference request to verify the model can
+	// actually generate tokens. This catches SIGSEGV crashes and empty-response
+	// bugs that the /v1/models health endpoint does not detect.
+	inferenceURL := fmt.Sprintf("http://%s:%d/v1/chat/completions", host, port)
+	testPayload := `{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":4}`
+
+	inferenceClient := &http.Client{Timeout: 15 * time.Second}
+	inferResp, inferErr := inferenceClient.Post(inferenceURL, "application/json", strings.NewReader(testPayload))
+	if inferErr != nil {
+		return CheckResult{
+			Name:    "BitNet Local Inference",
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("BitNet server responds to health checks but inference failed: %v (model may crash on real prompts)", inferErr),
+		}
+	}
+	defer inferResp.Body.Close()
+
+	if inferResp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(inferResp.Body)
+		return CheckResult{
+			Name:    "BitNet Local Inference",
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("BitNet inference returned HTTP %d: %s", inferResp.StatusCode, strings.TrimSpace(string(bodyBytes))),
+		}
+	}
+
+	// Parse the response to verify tokens were actually generated.
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if decErr := json.NewDecoder(inferResp.Body).Decode(&result); decErr != nil {
+		return CheckResult{
+			Name:    "BitNet Local Inference",
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("BitNet inference response could not be parsed: %v", decErr),
+		}
+	}
+
+	if result.Usage.CompletionTokens == 0 && (len(result.Choices) == 0 || result.Choices[0].Message.Content == "") {
+		return CheckResult{
+			Name:    "BitNet Local Inference",
+			Status:  StatusWarning,
+			Message: "BitNet server responds but generated zero tokens (model may be non-functional)",
 		}
 	}
 
 	return CheckResult{
 		Name:    "BitNet Local Inference",
-		Status:  StatusWarning,
-		Message: fmt.Sprintf("BitNet server returned status %d at %s", resp.StatusCode, url),
+		Status:  StatusPass,
+		Message: fmt.Sprintf("BitNet server responding and generating tokens at %s:%d", host, port),
 	}
 }
 
