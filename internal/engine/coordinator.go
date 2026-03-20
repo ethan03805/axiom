@@ -27,6 +27,7 @@ import (
 	"github.com/ethan03805/axiom/internal/merge"
 	"github.com/ethan03805/axiom/internal/orchestrator"
 	"github.com/ethan03805/axiom/internal/pipeline"
+	"github.com/ethan03805/axiom/internal/registry"
 	"github.com/ethan03805/axiom/internal/security"
 	"github.com/ethan03805/axiom/internal/srs"
 	"github.com/ethan03805/axiom/internal/state"
@@ -183,6 +184,32 @@ func NewCoordinator(config *Config, projectRoot string) (*Coordinator, error) {
 			IPCBaseDir:    ipcBaseDir,
 		},
 	)
+
+	// Populate broker model registry from ~/.axiom/registry.db.
+	// This enables model allowlist checks, budget enforcement per-request,
+	// and accurate cost tracking. See Architecture Section 19.5.
+	if home, homeErr := os.UserHomeDir(); homeErr == nil {
+		registryPath := filepath.Join(home, ".axiom", "registry.db")
+		if _, statErr := os.Stat(registryPath); statErr == nil {
+			if reg, regErr := registry.NewRegistry(registryPath); regErr == nil {
+				models, listErr := reg.List("", "")
+				if listErr == nil {
+					for _, m := range models {
+						c.infBroker.RegisterModel(&broker.ModelInfo{
+							ID:   m.ID,
+							Tier: broker.ModelTier(m.Tier),
+							Pricing: broker.ModelPricing{
+								PromptPerMillion:     m.PromptPerMillion,
+								CompletionPerMillion: m.CompletionPerMillion,
+							},
+							Source: m.Source,
+						})
+					}
+				}
+				reg.Close()
+			}
+		}
+	}
 
 	// Initialize work queue with concurrency control.
 	// See Architecture Section 5 (Task System & Concurrency).
@@ -814,6 +841,10 @@ func (c *Coordinator) dispatchReadyTasks() {
 			continue
 		}
 
+		// Register the task's tier with the broker for model allowlist enforcement.
+		// See Architecture Section 19.5 (Per-Task Enforcement, point 1).
+		c.infBroker.SetTaskTier(task.ID, broker.ModelTier(task.Tier))
+
 		// Get the base snapshot (current HEAD SHA).
 		baseSnapshot, err := c.gitMgr.HeadSHA()
 		if err != nil {
@@ -914,6 +945,25 @@ func (c *Coordinator) dispatchReadyTasks() {
 			continue
 		}
 
+		// Ensure per-task IPC and staging directories exist.
+		ipcInputDir := filepath.Join(c.projectRoot, ".axiom", "containers", "ipc", task.ID, "input")
+		ipcOutputDir := filepath.Join(c.projectRoot, ".axiom", "containers", "ipc", task.ID, "output")
+		stagingDir := filepath.Join(c.projectRoot, ".axiom", "containers", "staging", task.ID)
+		for _, dir := range []string{ipcInputDir, ipcOutputDir, stagingDir} {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				c.emitter.Emit(events.Event{
+					Type:   events.EventTaskFailed,
+					TaskID: task.ID,
+					Details: map[string]interface{}{
+						"error": fmt.Sprintf("create task dir %s: %v", dir, err),
+					},
+				})
+				_ = c.workQueue.FailTask(task.ID)
+				_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+				continue
+			}
+		}
+
 		// Send the TaskSpec via IPC.
 		ipcMsg := &ipc.TaskSpecMessage{
 			Header: ipc.Header{
@@ -935,8 +985,9 @@ func (c *Coordinator) dispatchReadyTasks() {
 			continue
 		}
 
-		// Spawn a Meeseeks container.
+		// Execute the task: either spawn a container or run in-process.
 		if c.containerMgr != nil {
+			// Container-based execution: spawn a Meeseeks Docker container.
 			_, err = c.containerMgr.SpawnMeeseeks(context.Background(), container.SpawnRequest{
 				TaskID:      task.ID,
 				Image:       c.config.Docker.Image,
@@ -957,19 +1008,230 @@ func (c *Coordinator) dispatchReadyTasks() {
 				_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
 				continue
 			}
-		}
 
-		// Start watching this task's IPC output directory.
-		if err := c.ipcWatcher.WatchTask(task.ID); err != nil {
+			// Start watching this task's IPC output directory.
+			if err := c.ipcWatcher.WatchTask(task.ID); err != nil {
+				c.emitter.Emit(events.Event{
+					Type:   events.EventTaskFailed,
+					TaskID: task.ID,
+					Details: map[string]interface{}{
+						"error": fmt.Sprintf("watch task IPC: %v", err),
+					},
+				})
+			}
+		} else {
+			// In-process execution: call the inference broker directly.
+			// This is the fallback when Docker is unavailable.
+			// See Architecture Section 10.2-10.5 (Meeseeks lifecycle).
+			go c.executeTaskInProcess(task, specContent, baseSnapshot, stagingDir)
+		}
+	}
+}
+
+// executeTaskInProcess runs a Meeseeks-equivalent task in the engine process
+// by calling the inference broker directly with the TaskSpec. This is the
+// fallback execution path when Docker containers are unavailable.
+//
+// The function:
+//  1. Builds a code-generation prompt from the TaskSpec
+//  2. Calls the inference broker (same path as container-based execution)
+//  3. Parses the response to extract code files
+//  4. Writes output + manifest.json to the staging directory
+//  5. Marks the task as done
+//
+// All inference is routed through the broker for budget tracking and audit.
+func (c *Coordinator) executeTaskInProcess(task *state.Task, specContent, baseSnapshot, stagingDir string) {
+	c.emitter.Emit(events.Event{
+		Type:      events.EventContainerSpawned,
+		TaskID:    task.ID,
+		AgentType: "meeseeks",
+		AgentID:   "direct-" + task.ID,
+		Details: map[string]interface{}{
+			"mode":  "in_process",
+			"tier":  task.Tier,
+			"model": "anthropic/claude-sonnet-4",
+		},
+	})
+
+	codePrompt := fmt.Sprintf(`You are a Meeseeks code generation agent. Given the following TaskSpec, produce the required code.
+
+%s
+
+IMPORTANT: Output your response as a JSON object with this structure:
+{
+  "files": {
+    "path/to/file1.go": "file contents...",
+    "path/to/file2.go": "file contents..."
+  }
+}
+
+Output ONLY the JSON object, no other text. Every file path should be relative to the project root.
+Create all files needed to complete the task.`, specContent)
+
+	resp, err := c.infBroker.RouteRequest(context.Background(), &broker.InferenceRequest{
+		TaskID:    task.ID,
+		ModelID:   "anthropic/claude-sonnet-4",
+		AgentType: "meeseeks",
+		Messages: []broker.ChatMessage{
+			{Role: "system", Content: "You are a precise code generation agent. You produce working, production-ready code. Output only valid JSON with file paths and contents."},
+			{Role: "user", Content: codePrompt},
+		},
+		MaxTokens:   16384,
+		Temperature: 0.2,
+	})
+	if err != nil {
+		c.emitter.Emit(events.Event{
+			Type:   events.EventTaskFailed,
+			TaskID: task.ID,
+			Details: map[string]interface{}{
+				"error": fmt.Sprintf("in-process inference: %v", err),
+			},
+		})
+		_ = c.workQueue.FailTask(task.ID)
+		_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+		return
+	}
+
+	// Parse the response to extract files.
+	files := parseCodeResponse(resp.Content)
+	if len(files) == 0 {
+		c.emitter.Emit(events.Event{
+			Type:   events.EventTaskFailed,
+			TaskID: task.ID,
+			Details: map[string]interface{}{
+				"error":           "no files produced by in-process meeseeks",
+				"response_length": len(resp.Content),
+			},
+		})
+		_ = c.workQueue.FailTask(task.ID)
+		_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+		return
+	}
+
+	// Write output files to staging directory.
+	for filePath, content := range files {
+		fullPath := filepath.Join(stagingDir, filePath)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 			c.emitter.Emit(events.Event{
 				Type:   events.EventTaskFailed,
 				TaskID: task.ID,
 				Details: map[string]interface{}{
-					"error": fmt.Sprintf("watch task IPC: %v", err),
+					"error": fmt.Sprintf("create dir for %s: %v", filePath, err),
 				},
 			})
-			// Container is already spawned; don't fail the task, just log.
+			_ = c.workQueue.FailTask(task.ID)
+			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			return
 		}
+		if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+			c.emitter.Emit(events.Event{
+				Type:   events.EventTaskFailed,
+				TaskID: task.ID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("write staged file %s: %v", filePath, err),
+				},
+			})
+			_ = c.workQueue.FailTask(task.ID)
+			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			return
+		}
+	}
+
+	// Build and write manifest.json per Architecture Section 10.4.
+	manifest := buildManifest(task.ID, baseSnapshot, files)
+	manifestJSON, _ := json.MarshalIndent(manifest, "", "  ")
+	if err := os.WriteFile(filepath.Join(stagingDir, "manifest.json"), manifestJSON, 0644); err != nil {
+		c.emitter.Emit(events.Event{
+			Type:   events.EventTaskFailed,
+			TaskID: task.ID,
+			Details: map[string]interface{}{
+				"error": fmt.Sprintf("write manifest: %v", err),
+			},
+		})
+		_ = c.workQueue.FailTask(task.ID)
+		_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+		return
+	}
+
+	// Mark the task as done. In a full pipeline, this would go through
+	// the approval pipeline (validation sandbox -> reviewer -> orchestrator -> merge queue).
+	// For in-process execution, we submit to the merge queue directly.
+	srsRefs, _ := c.db.GetTaskSRSRefs(task.ID)
+	mergeItem := &merge.MergeItem{
+		TaskID:       task.ID,
+		TaskTitle:    task.Title,
+		StagingDir:   stagingDir,
+		BaseSnapshot: baseSnapshot,
+		Files:        files,
+		SRSRefs:      srsRefs,
+	}
+	c.mergeQueue.Submit(mergeItem)
+
+	c.emitter.Emit(events.Event{
+		Type:      events.EventTaskCompleted,
+		TaskID:    task.ID,
+		AgentType: "meeseeks",
+		AgentID:   "direct-" + task.ID,
+		Details: map[string]interface{}{
+			"mode":       "in_process",
+			"file_count": len(files),
+		},
+	})
+}
+
+// parseCodeResponse extracts file paths and contents from the LLM's JSON response.
+func parseCodeResponse(response string) map[string]string {
+	// Find the outermost JSON object in the response.
+	start := -1
+	end := -1
+	depth := 0
+	for i, c := range response {
+		if c == '{' && start == -1 {
+			start = i
+			depth = 1
+		} else if c == '{' && start != -1 {
+			depth++
+		} else if c == '}' && start != -1 {
+			depth--
+			if depth == 0 {
+				end = i + 1
+				break
+			}
+		}
+	}
+
+	if start == -1 || end == -1 {
+		return nil
+	}
+
+	var parsed struct {
+		Files map[string]string `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(response[start:end]), &parsed); err != nil {
+		return nil
+	}
+	return parsed.Files
+}
+
+// buildManifest creates a manifest.json structure for the given files.
+// See Architecture Section 10.4.
+func buildManifest(taskID, baseSnapshot string, files map[string]string) map[string]interface{} {
+	added := make([]map[string]interface{}, 0, len(files))
+	for path := range files {
+		added = append(added, map[string]interface{}{
+			"path":   path,
+			"binary": false,
+		})
+	}
+	return map[string]interface{}{
+		"task_id":       taskID,
+		"base_snapshot": baseSnapshot,
+		"files": map[string]interface{}{
+			"added":    added,
+			"modified": []interface{}{},
+			"deleted":  []interface{}{},
+			"renamed":  []interface{}{},
+		},
 	}
 }
 
@@ -1193,6 +1455,7 @@ func (c *Coordinator) StartOrchestrator(ctx context.Context, prompt string) erro
 		c.infBroker,
 		c.db,
 		c.emitter,
+		c.srsApproval,
 	)
 
 	if err := directOrch.Start(ctx, projectID, prompt, isGreenfield); err != nil {

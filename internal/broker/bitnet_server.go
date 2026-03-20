@@ -8,8 +8,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -115,6 +117,61 @@ func (s *BitNetServer) Start() error {
 	return nil
 }
 
+// pidFilePath returns the path to the BitNet server PID file.
+func (s *BitNetServer) pidFilePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".axiom", "bitnet", "server.pid")
+}
+
+// logFilePath returns the path to the BitNet server log file.
+func (s *BitNetServer) logFilePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".axiom", "bitnet", "server.log")
+}
+
+// writePIDFile writes the server process PID to disk for later stop/status.
+func (s *BitNetServer) writePIDFile(pid int) error {
+	dir := filepath.Dir(s.pidFilePath())
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(s.pidFilePath(), []byte(strconv.Itoa(pid)), 0644)
+}
+
+// readPIDFile reads the stored PID from the PID file.
+func (s *BitNetServer) readPIDFile() (int, error) {
+	data, err := os.ReadFile(s.pidFilePath())
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(data)))
+}
+
+// removePIDFile removes the PID file.
+func (s *BitNetServer) removePIDFile() {
+	os.Remove(s.pidFilePath())
+}
+
+// daemonizeCmd configures a command to run as a detached daemon process.
+// Uses Setsid to create a new session so the child survives parent exit.
+func (s *BitNetServer) daemonizeCmd(cmd *exec.Cmd) error {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	// Redirect stdout/stderr to a log file instead of the terminal.
+	logDir := filepath.Dir(s.logFilePath())
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return fmt.Errorf("create log dir: %w", err)
+	}
+	logFile, err := os.OpenFile(s.logFilePath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("open log file: %w", err)
+	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Stdin = nil
+	return nil
+}
+
 // startViaPythonWrapper starts the BitNet server using run_inference_server.py.
 // This is the preferred method as it handles correct initialization of the
 // 1.58-bit kernels that the direct binary invocation fails to do properly.
@@ -152,12 +209,23 @@ func (s *BitNetServer) startViaPythonWrapper(bitnetDir, modelPath string) error 
 
 	s.cmd = exec.Command(pythonPath, args...)
 	s.cmd.Dir = bitnetDir
-	s.cmd.Stdout = os.Stdout
-	s.cmd.Stderr = os.Stderr
+
+	// Daemonize: detach from parent process group so server survives CLI exit.
+	if err := s.daemonizeCmd(s.cmd); err != nil {
+		return fmt.Errorf("daemonize: %w", err)
+	}
 
 	if err := s.cmd.Start(); err != nil {
 		return fmt.Errorf("start BitNet server via Python wrapper: %w", err)
 	}
+
+	// Write PID file for later stop/status commands.
+	if err := s.writePIDFile(s.cmd.Process.Pid); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not write PID file: %v\n", err)
+	}
+
+	// Release the process so it doesn't become a zombie when we exit.
+	s.cmd.Process.Release()
 
 	s.running = true
 	s.startedAt = time.Now()
@@ -190,12 +258,23 @@ func (s *BitNetServer) startDirectBinary(bitnetDir, modelPath string) error {
 	if bitnetDir != "" {
 		s.cmd.Dir = bitnetDir
 	}
-	s.cmd.Stdout = os.Stdout
-	s.cmd.Stderr = os.Stderr
+
+	// Daemonize: detach from parent process group so server survives CLI exit.
+	if err := s.daemonizeCmd(s.cmd); err != nil {
+		return fmt.Errorf("daemonize: %w", err)
+	}
 
 	if err := s.cmd.Start(); err != nil {
 		return fmt.Errorf("start BitNet server: %w", err)
 	}
+
+	// Write PID file for later stop/status commands.
+	if err := s.writePIDFile(s.cmd.Process.Pid); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not write PID file: %v\n", err)
+	}
+
+	// Release the process so it doesn't become a zombie when we exit.
+	s.cmd.Process.Release()
 
 	s.running = true
 	s.startedAt = time.Now()
@@ -216,15 +295,13 @@ func (s *BitNetServer) Stop() error {
 }
 
 // stopInternal shuts down the BitNet server without acquiring the mutex.
-// Used by Start() when cleanup is needed while the lock is already held.
+// Supports both in-process (cmd handle) and daemonized (PID file) servers.
 func (s *BitNetServer) stopInternal() error {
-	if !s.running {
-		return nil
-	}
+	stopped := false
 
+	// Try stopping via the in-memory command handle.
 	if s.cmd != nil && s.cmd.Process != nil {
 		s.cmd.Process.Signal(os.Interrupt)
-		// Give it 5 seconds to shut down gracefully.
 		done := make(chan error, 1)
 		go func() { done <- s.cmd.Wait() }()
 		select {
@@ -232,14 +309,36 @@ func (s *BitNetServer) stopInternal() error {
 		case <-time.After(5 * time.Second):
 			s.cmd.Process.Kill()
 		}
+		stopped = true
 	}
 
+	// Also try stopping via PID file (for daemonized servers started by a
+	// previous CLI invocation).
+	if !stopped {
+		if pid, err := s.readPIDFile(); err == nil {
+			proc, findErr := os.FindProcess(pid)
+			if findErr == nil {
+				_ = proc.Signal(os.Interrupt)
+				// Give it 5 seconds to shut down gracefully.
+				time.Sleep(2 * time.Second)
+				// Check if still running by sending signal 0.
+				if proc.Signal(syscall.Signal(0)) == nil {
+					_ = proc.Kill()
+				}
+			}
+		}
+	}
+
+	s.removePIDFile()
 	s.running = false
 	s.cmd = nil
 	return nil
 }
 
 // Status returns the current server status.
+// It probes the actual HTTP endpoint to determine if the server is running,
+// regardless of in-memory state. This correctly handles servers that were
+// started by a previous CLI invocation or that have crashed.
 func (s *BitNetServer) Status() *BitNetStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -254,7 +353,29 @@ func (s *BitNetServer) Status() *BitNetStatus {
 		ActiveRequests: s.activeReq,
 	}
 
-	if s.running {
+	// Probe the actual server endpoint to determine real running status.
+	// This handles servers started by previous CLI invocations (daemonized)
+	// and detects servers that crashed without updating in-memory state.
+	url := fmt.Sprintf("http://%s:%d/v1/models", s.config.Host, s.config.Port)
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(url)
+	if err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			status.Running = true
+			// If we didn't know it was running, estimate uptime from PID file.
+			if !s.running {
+				if info, statErr := os.Stat(s.pidFilePath()); statErr == nil {
+					status.Uptime = time.Since(info.ModTime())
+				}
+			}
+		}
+	} else {
+		// Server is not responding -- mark as not running regardless of in-memory state.
+		status.Running = false
+	}
+
+	if s.running && status.Running {
 		status.Uptime = time.Since(s.startedAt)
 	}
 

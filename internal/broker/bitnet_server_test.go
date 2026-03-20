@@ -24,10 +24,12 @@ func TestBitNetServerDefaults(t *testing.T) {
 }
 
 func TestBitNetServerStatus(t *testing.T) {
+	// Use a port unlikely to have a real server to avoid false positives
+	// from the HTTP probe in Status().
 	srv := NewBitNetServer(BitNetServerConfig{
 		Enabled:    true,
 		Host:       "localhost",
-		Port:       3002,
+		Port:       59999,
 		CPUThreads: 8,
 	})
 
@@ -38,7 +40,7 @@ func TestBitNetServerStatus(t *testing.T) {
 	if status.Running {
 		t.Error("should not be running before Start()")
 	}
-	if status.Port != 3002 {
+	if status.Port != 59999 {
 		t.Errorf("port = %d", status.Port)
 	}
 	if status.CPUThreads != 8 {

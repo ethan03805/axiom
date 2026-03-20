@@ -185,6 +185,16 @@ func DefaultConfig() *Config {
 
 // LoadConfig loads configuration from both global (~/.axiom/config.toml)
 // and project (.axiom/config.toml) paths, with project config overriding global.
+//
+// The merge strategy is:
+//  1. Start with built-in defaults (DefaultConfig)
+//  2. Apply global config -- only fields present in the file are set
+//  3. Apply project config -- only fields present in the file are set
+//
+// BurntSushi/toml's DecodeFile only modifies fields that appear in the TOML
+// file, so a field set by the global config is preserved unless the project
+// config explicitly overrides it. For boolean fields like bitnet.enabled,
+// the project must explicitly include the field to override the global value.
 func LoadConfig() (*Config, error) {
 	cfg := DefaultConfig()
 
@@ -199,15 +209,90 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	// Load project config (overrides global)
+	// Load project config (overrides global).
+	// We use a temporary struct to decode the project config, then merge
+	// only the sections that actually appear in the project file. This
+	// prevents an empty project [bitnet] section from resetting values
+	// set by the global config.
 	projectPath := filepath.Join(".axiom", "config.toml")
 	if _, err := os.Stat(projectPath); err == nil {
-		if _, err := toml.DecodeFile(projectPath, cfg); err != nil {
+		projectCfg := DefaultConfig()
+		meta, err := toml.DecodeFile(projectPath, projectCfg)
+		if err != nil {
 			return nil, err
 		}
+		mergeProjectConfig(cfg, projectCfg, meta)
 	}
 
 	return cfg, nil
+}
+
+// mergeProjectConfig overlays the project config onto the base config,
+// but only for top-level sections that were explicitly present in the
+// project TOML file. This ensures that global-only settings are preserved
+// when the project config doesn't mention them.
+func mergeProjectConfig(base, project *Config, meta toml.MetaData) {
+	if meta.IsDefined("project") {
+		base.Project = project.Project
+	}
+	if meta.IsDefined("budget") {
+		base.Budget = project.Budget
+	}
+	if meta.IsDefined("concurrency") {
+		base.Concurrency = project.Concurrency
+	}
+	if meta.IsDefined("orchestrator") {
+		base.Orchestrator = project.Orchestrator
+	}
+	if meta.IsDefined("bitnet") {
+		// For bitnet, merge individual fields that were explicitly set
+		// so that project can override just enabled without losing host/port from global.
+		if meta.IsDefined("bitnet", "enabled") {
+			base.BitNet.Enabled = project.BitNet.Enabled
+		}
+		if meta.IsDefined("bitnet", "host") {
+			base.BitNet.Host = project.BitNet.Host
+		}
+		if meta.IsDefined("bitnet", "port") {
+			base.BitNet.Port = project.BitNet.Port
+		}
+		if meta.IsDefined("bitnet", "max_concurrent_requests") {
+			base.BitNet.MaxConcurrentRequests = project.BitNet.MaxConcurrentRequests
+		}
+		if meta.IsDefined("bitnet", "cpu_threads") {
+			base.BitNet.CPUThreads = project.BitNet.CPUThreads
+		}
+		if meta.IsDefined("bitnet", "binary_path") {
+			base.BitNet.BinaryPath = project.BitNet.BinaryPath
+		}
+		if meta.IsDefined("bitnet", "models_dir") {
+			base.BitNet.ModelsDir = project.BitNet.ModelsDir
+		}
+		if meta.IsDefined("bitnet", "model_repo") {
+			base.BitNet.ModelRepo = project.BitNet.ModelRepo
+		}
+	}
+	if meta.IsDefined("docker") {
+		base.Docker = project.Docker
+	}
+	if meta.IsDefined("validation") {
+		base.Validation = project.Validation
+	}
+	if meta.IsDefined("security") {
+		base.Security = project.Security
+	}
+	if meta.IsDefined("git") {
+		base.Git = project.Git
+	}
+	if meta.IsDefined("api") {
+		base.API = project.API
+	}
+	if meta.IsDefined("observability") {
+		base.Observability = project.Observability
+	}
+	if meta.IsDefined("openrouter") {
+		base.OpenRouter = project.OpenRouter
+	}
 }
 
 // LoadConfigFrom loads configuration from a specific file path.

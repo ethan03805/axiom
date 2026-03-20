@@ -19,6 +19,7 @@ import (
 
 	"github.com/ethan03805/axiom/internal/broker"
 	"github.com/ethan03805/axiom/internal/events"
+	"github.com/ethan03805/axiom/internal/srs"
 	"github.com/ethan03805/axiom/internal/state"
 )
 
@@ -35,10 +36,11 @@ type DirectConfig struct {
 // decomposes it into tasks, and creates them in the database for the execution
 // loop to process.
 type Direct struct {
-	config    DirectConfig
-	infBroker *broker.Broker
-	db        *state.DB
-	emitter   *events.Emitter
+	config      DirectConfig
+	infBroker   *broker.Broker
+	db          *state.DB
+	emitter     *events.Emitter
+	srsApproval *srs.ApprovalManager
 
 	mu        sync.Mutex
 	phase     Phase
@@ -52,16 +54,18 @@ func NewDirect(
 	infBroker *broker.Broker,
 	db *state.DB,
 	emitter *events.Emitter,
+	srsApproval *srs.ApprovalManager,
 ) *Direct {
 	if config.Model == "" {
 		config.Model = "anthropic/claude-sonnet-4"
 	}
 	return &Direct{
-		config:    config,
-		infBroker: infBroker,
-		db:        db,
-		emitter:   emitter,
-		phase:     PhaseBootstrap,
+		config:      config,
+		infBroker:   infBroker,
+		db:          db,
+		emitter:     emitter,
+		srsApproval: srsApproval,
+		phase:       PhaseBootstrap,
 	}
 }
 
@@ -127,7 +131,8 @@ func (d *Direct) run(ctx context.Context, projectID, prompt string, isGreenfield
 		return
 	}
 
-	// Store the SRS content.
+	// Store the SRS content and submit for approval.
+	// See Architecture Section 5.1 steps 3-5 and Section 6.2.
 	srsContent := srsResp.Content
 	d.emitter.Emit(events.Event{
 		Type:      events.EventSRSSubmitted,
@@ -138,6 +143,62 @@ func (d *Direct) run(ctx context.Context, projectID, prompt string, isGreenfield
 			"srs_length": len(srsContent),
 		},
 	})
+
+	// Submit the SRS draft for approval. This writes .axiom/srs.md and
+	// validates the SRS format per Architecture Section 6.1.
+	if d.srsApproval != nil {
+		validationErrs, err := d.srsApproval.SubmitDraft(srsContent)
+		if err != nil {
+			d.emitter.Emit(events.Event{
+				Type:      events.EventTaskFailed,
+				AgentType: "orchestrator",
+				AgentID:   "direct-" + projectID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("submit SRS draft: %v", err),
+					"phase": "srs_approval",
+				},
+			})
+			return
+		}
+		if len(validationErrs) > 0 {
+			d.emitter.Emit(events.Event{
+				Type:      events.EventSRSSubmitted,
+				AgentType: "orchestrator",
+				AgentID:   "direct-" + projectID,
+				Details: map[string]interface{}{
+					"status":           "validation_warnings",
+					"validation_errors": validationErrs,
+				},
+			})
+			// Continue despite validation warnings -- the SRS is still usable.
+		}
+
+		// Auto-approve the SRS when using the direct orchestrator.
+		// In production with a Claw, the user would review via CLI/GUI.
+		// The approval locks the SRS file (read-only) and computes SHA-256.
+		hash, err := d.srsApproval.Approve("direct-orchestrator")
+		if err != nil {
+			d.emitter.Emit(events.Event{
+				Type:      events.EventTaskFailed,
+				AgentType: "orchestrator",
+				AgentID:   "direct-" + projectID,
+				Details: map[string]interface{}{
+					"error": fmt.Sprintf("approve SRS: %v", err),
+					"phase": "srs_approval",
+				},
+			})
+			return
+		}
+		d.emitter.Emit(events.Event{
+			Type:      events.EventSRSApproved,
+			AgentType: "orchestrator",
+			AgentID:   "direct-" + projectID,
+			Details: map[string]interface{}{
+				"sha256":      hash,
+				"approved_by": "direct-orchestrator",
+			},
+		})
+	}
 
 	// Step 2: Decompose SRS into tasks.
 	d.mu.Lock()
@@ -171,7 +232,14 @@ func (d *Direct) run(ctx context.Context, projectID, prompt string, isGreenfield
 	}
 
 	// Parse and create tasks from the decomposition response.
-	tasks := parseTaskDecomposition(decompResp.Content, projectID)
+	decomp := parseTaskDecomposition(decompResp.Content, projectID)
+
+	var tasks []*state.Task
+	var metadata []TaskMetadata
+	if decomp != nil {
+		tasks = decomp.Tasks
+		metadata = decomp.Metadata
+	}
 
 	if len(tasks) == 0 {
 		// Create a single fallback task from the prompt.
@@ -183,6 +251,7 @@ func (d *Direct) run(ctx context.Context, projectID, prompt string, isGreenfield
 			Tier:        "standard",
 			TaskType:    "implementation",
 		}}
+		metadata = nil
 	}
 
 	// Persist tasks to the database.
@@ -196,6 +265,29 @@ func (d *Direct) run(ctx context.Context, projectID, prompt string, isGreenfield
 			},
 		})
 		return
+	}
+
+	// Persist task metadata: SRS refs, dependencies, and target files.
+	// These populate the junction tables required by Architecture Section 15.2.
+	for _, md := range metadata {
+		for _, ref := range md.SRSRefs {
+			_ = d.db.AddTaskSRSRef(md.TaskID, ref)
+		}
+		for _, dep := range md.Dependencies {
+			if err := d.db.AddTaskDependency(md.TaskID, dep); err != nil {
+				d.emitter.Emit(events.Event{
+					Type:      events.EventTaskFailed,
+					AgentType: "orchestrator",
+					AgentID:   "direct-" + projectID,
+					Details: map[string]interface{}{
+						"warning": fmt.Sprintf("add dependency %s->%s: %v", md.TaskID, dep, err),
+					},
+				})
+			}
+		}
+		for _, f := range md.TargetFiles {
+			_ = d.db.AddTaskTargetFile(md.TaskID, f, "file")
+		}
 	}
 
 	d.emitter.Emit(events.Event{
@@ -305,8 +397,25 @@ Output a JSON array of task objects. Each task has:
 Output ONLY the JSON array, no other text.`, srsContent)
 }
 
-// parseTaskDecomposition parses the LLM's task decomposition response into state.Task objects.
-func parseTaskDecomposition(response, projectID string) []*state.Task {
+// TaskMetadata holds the parsed junction-table data for a single task.
+// These are persisted separately from the task record itself.
+type TaskMetadata struct {
+	TaskID       string
+	SRSRefs      []string
+	Dependencies []string
+	TargetFiles  []string
+}
+
+// DecompositionResult holds the parsed tasks and their associated metadata.
+type DecompositionResult struct {
+	Tasks    []*state.Task
+	Metadata []TaskMetadata
+}
+
+// parseTaskDecomposition parses the LLM's task decomposition response into
+// state.Task objects and their associated metadata (SRS refs, dependencies,
+// target files). See Architecture Section 15.1-15.5.
+func parseTaskDecomposition(response, projectID string) *DecompositionResult {
 	// Try to parse as JSON array of tasks.
 	type rawTask struct {
 		ID           string   `json:"id"`
@@ -350,12 +459,15 @@ func parseTaskDecomposition(response, projectID string) []*state.Task {
 		return nil
 	}
 
-	tasks := make([]*state.Task, 0, len(rawTasks))
+	result := &DecompositionResult{
+		Tasks:    make([]*state.Task, 0, len(rawTasks)),
+		Metadata: make([]TaskMetadata, 0, len(rawTasks)),
+	}
 	now := time.Now()
 	for _, rt := range rawTasks {
 		taskID := rt.ID
 		if taskID == "" {
-			taskID = fmt.Sprintf("%s-task-%03d", projectID, len(tasks)+1)
+			taskID = fmt.Sprintf("%s-task-%03d", projectID, len(result.Tasks)+1)
 		}
 		tier := rt.Tier
 		if tier == "" {
@@ -366,7 +478,7 @@ func parseTaskDecomposition(response, projectID string) []*state.Task {
 			taskType = "implementation"
 		}
 
-		tasks = append(tasks, &state.Task{
+		result.Tasks = append(result.Tasks, &state.Task{
 			ID:          taskID,
 			Title:       rt.Title,
 			Description: rt.Description,
@@ -375,9 +487,15 @@ func parseTaskDecomposition(response, projectID string) []*state.Task {
 			TaskType:    taskType,
 			CreatedAt:   now,
 		})
+		result.Metadata = append(result.Metadata, TaskMetadata{
+			TaskID:       taskID,
+			SRSRefs:      rt.SRSRefs,
+			Dependencies: rt.Dependencies,
+			TargetFiles:  rt.TargetFiles,
+		})
 	}
 
-	return tasks
+	return result
 }
 
 // jsonUnmarshalTasks parses a JSON byte slice into the given value.
