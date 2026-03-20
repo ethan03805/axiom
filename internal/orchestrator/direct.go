@@ -25,10 +25,11 @@ import (
 
 // DirectConfig holds configuration for the direct (in-process) orchestrator.
 type DirectConfig struct {
-	Runtime     Runtime
-	BudgetUSD   float64
-	ProjectSlug string
-	Model       string // Default model to use for orchestration (e.g. "anthropic/claude-sonnet-4")
+	Runtime              Runtime
+	BudgetUSD            float64
+	ProjectSlug          string
+	Model                string // Default model to use for orchestration (e.g. "anthropic/claude-sonnet-4")
+	SRSApprovalDelegate  string // "user" (default) or "claw" -- controls whether SRS is auto-approved
 }
 
 // Direct is an in-process orchestrator that calls the inference broker directly
@@ -173,31 +174,63 @@ func (d *Direct) run(ctx context.Context, projectID, prompt string, isGreenfield
 			// Continue despite validation warnings -- the SRS is still usable.
 		}
 
-		// Auto-approve the SRS when using the direct orchestrator.
-		// In production with a Claw, the user would review via CLI/GUI.
-		// The approval locks the SRS file (read-only) and computes SHA-256.
-		hash, err := d.srsApproval.Approve("direct-orchestrator")
-		if err != nil {
+		// Only auto-approve the SRS when the delegate is set to "claw"
+		// (meaning a Claw proxy is trusted to approve). When the delegate
+		// is "user" (default), wait for the user to approve via CLI/GUI.
+		// See Architecture Section 8.5.
+		if d.config.SRSApprovalDelegate == "claw" {
+			hash, err := d.srsApproval.Approve("direct-orchestrator")
+			if err != nil {
+				d.emitter.Emit(events.Event{
+					Type:      events.EventTaskFailed,
+					AgentType: "orchestrator",
+					AgentID:   "direct-" + projectID,
+					Details: map[string]interface{}{
+						"error": fmt.Sprintf("approve SRS: %v", err),
+						"phase": "srs_approval",
+					},
+				})
+				return
+			}
 			d.emitter.Emit(events.Event{
-				Type:      events.EventTaskFailed,
+				Type:      events.EventSRSApproved,
 				AgentType: "orchestrator",
 				AgentID:   "direct-" + projectID,
 				Details: map[string]interface{}{
-					"error": fmt.Sprintf("approve SRS: %v", err),
-					"phase": "srs_approval",
+					"sha256":      hash,
+					"approved_by": "direct-orchestrator",
 				},
 			})
-			return
+		} else {
+			// Wait for user approval. Poll the SRS approval state.
+			d.emitter.Emit(events.Event{
+				Type:      events.EventSRSSubmitted,
+				AgentType: "orchestrator",
+				AgentID:   "direct-" + projectID,
+				Details: map[string]interface{}{
+					"status":   "awaiting_user_approval",
+					"delegate": d.config.SRSApprovalDelegate,
+				},
+			})
+			fmt.Println("\nSRS generated and written to .axiom/srs.md")
+			fmt.Println("Review the SRS, then approve with: axiom srs approve")
+			fmt.Println("Or reject with: axiom srs reject \"<feedback>\"")
+
+			// Poll until the SRS is approved or the context is cancelled.
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			approved := false
+			for !approved {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if d.srsApproval.IsApproved() {
+						approved = true
+					}
+				}
+			}
 		}
-		d.emitter.Emit(events.Event{
-			Type:      events.EventSRSApproved,
-			AgentType: "orchestrator",
-			AgentID:   "direct-" + projectID,
-			Details: map[string]interface{}{
-				"sha256":      hash,
-				"approved_by": "direct-orchestrator",
-			},
-		})
 	}
 
 	// Step 2: Decompose SRS into tasks.

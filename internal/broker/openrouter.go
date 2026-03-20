@@ -39,7 +39,7 @@ func NewOpenRouterClient(config OpenRouterConfig) *OpenRouterClient {
 	}
 	timeout := config.Timeout
 	if timeout == 0 {
-		timeout = 120 * time.Second
+		timeout = 300 * time.Second
 	}
 	return &OpenRouterClient{
 		apiKey:  config.APIKey,

@@ -90,17 +90,19 @@ func TestMergeQueueCurrentSnapshot(t *testing.T) {
 	}
 }
 
-func TestMergeQueueStaleSnapshot(t *testing.T) {
+func TestMergeQueueStaleSnapshotNoConflict(t *testing.T) {
 	q, gitMgr, tmpDir := setupTestQueue(t)
 
 	baseSHA, _ := gitMgr.HeadSHA()
 
-	// Advance HEAD by making another commit.
+	// Advance HEAD by making another commit to a different file.
 	os.WriteFile(filepath.Join(tmpDir, "other.txt"), []byte("other work"), 0644)
 	runGit(t, tmpDir, "add", "-A")
 	runGit(t, tmpDir, "commit", "-m", "advance HEAD")
 
 	// Submit with the old (stale) base snapshot.
+	// Since new.go does not conflict with other.txt, the merge should
+	// fast-forward the snapshot and succeed.
 	q.Submit(&MergeItem{
 		TaskID:       "task-stale",
 		TaskTitle:    "Stale task",
@@ -112,14 +114,40 @@ func TestMergeQueueStaleSnapshot(t *testing.T) {
 	if !ok {
 		t.Fatal("expected item to process")
 	}
+	if !result.Success {
+		t.Errorf("expected success for non-conflicting stale snapshot, got error: %s", result.Error)
+	}
+}
+
+func TestMergeQueueStaleSnapshotWithConflict(t *testing.T) {
+	q, gitMgr, tmpDir := setupTestQueue(t)
+
+	baseSHA, _ := gitMgr.HeadSHA()
+
+	// Advance HEAD by making another commit to the same file the task modifies.
+	os.WriteFile(filepath.Join(tmpDir, "conflict.go"), []byte("package old"), 0644)
+	runGit(t, tmpDir, "add", "-A")
+	runGit(t, tmpDir, "commit", "-m", "advance HEAD with conflicting file")
+
+	// Submit with the old (stale) base snapshot.
+	// Since conflict.go was changed in both HEAD and the task output,
+	// the merge should requeue.
+	q.Submit(&MergeItem{
+		TaskID:       "task-conflict",
+		TaskTitle:    "Conflicting task",
+		BaseSnapshot: baseSHA,
+		Files:        map[string]string{"conflict.go": "package new"},
+	})
+
+	result, ok := q.ProcessNext()
+	if !ok {
+		t.Fatal("expected item to process")
+	}
 	if result.Success {
-		t.Error("expected failure for stale snapshot")
+		t.Error("expected failure for conflicting stale snapshot")
 	}
 	if !result.NeedsRequeue {
-		t.Error("expected NeedsRequeue for stale snapshot")
-	}
-	if len(result.ChangedFiles) == 0 {
-		t.Error("expected changed files list for stale snapshot")
+		t.Error("expected NeedsRequeue for conflicting stale snapshot")
 	}
 }
 

@@ -53,6 +53,9 @@ func init() {
 	// Index commands (Section 27.6)
 	rootCmd.AddCommand(indexCmd)
 
+	// SRS commands
+	rootCmd.AddCommand(srsCmd)
+
 	// Utility commands (Section 27.7)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(doctorCmd)

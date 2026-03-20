@@ -47,6 +47,18 @@ const (
 	RuntimeClaw       Runtime = "claw"
 )
 
+// Orchestrator is the interface shared by all orchestrator implementations
+// (Embedded, Direct). The Coordinator stores this interface to interact with
+// whichever orchestrator mode is active.
+type Orchestrator interface {
+	Start(ctx context.Context, projectID, prompt string, isGreenfield bool) error
+	Stop(ctx context.Context) error
+	Pause()
+	Resume()
+	Complete()
+	CurrentPhase() Phase
+}
+
 // EmbeddedConfig holds configuration for the embedded orchestrator.
 type EmbeddedConfig struct {
 	Runtime     Runtime

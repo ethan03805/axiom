@@ -230,26 +230,35 @@ See Architecture Section 5.1 for the project lifecycle.`,
 			fmt.Fprintf(os.Stderr, "warning: orchestrator start: %v\n", err)
 		}
 
-		// Handle SIGHUP for config reload, SIGINT/SIGTERM for shutdown.
+		// Handle SIGHUP for config reload, SIGINT/SIGTERM for shutdown,
+		// and completion channel for graceful exit when all tasks are done.
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 
 		fmt.Println("\nPress Ctrl+C to stop.")
 		for {
-			sig := <-sigCh
-			if sig == syscall.SIGHUP {
-				fmt.Println("Reloading configuration...")
-				if err := coord.ReloadConfig(); err != nil {
-					fmt.Fprintf(os.Stderr, "config reload error: %v\n", err)
-				} else {
-					fmt.Println("Configuration reloaded successfully.")
+			select {
+			case sig := <-sigCh:
+				if sig == syscall.SIGHUP {
+					fmt.Println("Reloading configuration...")
+					if err := coord.ReloadConfig(); err != nil {
+						fmt.Fprintf(os.Stderr, "config reload error: %v\n", err)
+					} else {
+						fmt.Println("Configuration reloaded successfully.")
+					}
+					continue
 				}
-				continue
+				// SIGINT or SIGTERM: shutdown.
+				fmt.Println("\nShutting down...")
+				return nil
+			case <-coord.DoneCh():
+				// All tasks completed. Print summary and exit.
+				total, _ := coord.DB().GetProjectCost()
+				fmt.Printf("\nAll tasks completed. Total cost: $%.4f\n", total)
+				fmt.Println("Review the project branch and merge when satisfied.")
+				return nil
 			}
-			// SIGINT or SIGTERM: shutdown.
-			break
 		}
-		return nil
 	},
 }
 

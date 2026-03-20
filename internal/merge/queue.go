@@ -129,26 +129,70 @@ func (q *Queue) processItem(item *MergeItem) *MergeResult {
 		return result
 	}
 
-	// Step 3: If stale, attempt merge or re-queue.
+	// Step 3: If stale, attempt to merge anyway if no files overlap.
+	// This avoids re-running expensive inference when the task's output
+	// files do not conflict with files changed since the base snapshot.
 	if status == git.SnapshotStale {
-		// The output was built against an older commit. Since we can't
-		// do a true three-way merge of the Meeseeks output (it's not a
-		// git branch), we re-queue the task with updated context.
 		changed, _ := q.snapshot.ChangedFilesSince(item.BaseSnapshot)
-		result.NeedsRequeue = true
-		result.ChangedFiles = changed
-		result.Error = fmt.Sprintf("base snapshot stale: HEAD has advanced since %s (%d files changed)",
-			item.BaseSnapshot[:minLen(len(item.BaseSnapshot), 7)], len(changed))
+
+		// Check if any of the task's output files overlap with files
+		// changed since the base snapshot.
+		hasConflict := false
+		changedSet := make(map[string]bool, len(changed))
+		for _, f := range changed {
+			changedSet[f] = true
+		}
+		for filePath := range item.Files {
+			if changedSet[filePath] {
+				hasConflict = true
+				break
+			}
+		}
+		for _, delPath := range item.Deletions {
+			if changedSet[delPath] {
+				hasConflict = true
+				break
+			}
+		}
+
+		if hasConflict {
+			// Files overlap -- must requeue for fresh inference.
+			result.NeedsRequeue = true
+			result.ChangedFiles = changed
+			result.Error = fmt.Sprintf("base snapshot stale with conflicting files: HEAD has advanced since %s (%d files changed)",
+				item.BaseSnapshot[:minLen(len(item.BaseSnapshot), 7)], len(changed))
+
+			q.emitter.Emit(events.Event{
+				Type:   events.EventMergeCompleted,
+				TaskID: item.TaskID,
+				Details: map[string]interface{}{
+					"result":        "requeue_stale_conflict",
+					"changed_files": len(changed),
+				},
+			})
+			return result
+		}
+
+		// No file overlap -- update the base snapshot to current HEAD
+		// and proceed with the merge. This avoids redundant inference.
+		currentHead, headErr := q.gitMgr.HeadSHA()
+		if headErr != nil {
+			result.NeedsRequeue = true
+			result.Error = fmt.Sprintf("get HEAD for snapshot update: %v", headErr)
+			return result
+		}
+		item.BaseSnapshot = currentHead
 
 		q.emitter.Emit(events.Event{
 			Type:   events.EventMergeCompleted,
 			TaskID: item.TaskID,
 			Details: map[string]interface{}{
-				"result":        "requeue_stale",
-				"changed_files": len(changed),
+				"result":           "snapshot_fast_forward",
+				"changed_files":    len(changed),
+				"new_base":         currentHead[:minLen(len(currentHead), 7)],
 			},
 		})
-		return result
+		// Fall through to continue with the merge using the updated snapshot.
 	}
 
 	if status == git.SnapshotDiverged {

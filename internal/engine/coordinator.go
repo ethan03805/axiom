@@ -12,8 +12,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,7 +66,7 @@ type Coordinator struct {
 	budgetTracker *budget.Tracker
 	secretScanner *security.SecretScanner
 	semanticIdx   *index.Indexer
-	orchestratorMgr *orchestrator.Embedded
+	orchestratorMgr orchestrator.Orchestrator
 	validationSandbox *container.ValidationSandbox
 	taskSpecBuilder *TaskSpecBuilder
 
@@ -74,6 +77,7 @@ type Coordinator struct {
 	projectRoot string
 	projectID   string
 	stopCh      chan struct{}
+	doneCh      chan struct{} // Closed when all tasks complete; signals CLI to exit
 }
 
 // NewCoordinator creates a fully-wired Coordinator from the given configuration.
@@ -101,6 +105,7 @@ func NewCoordinator(config *Config, projectRoot string) (*Coordinator, error) {
 		emitter:     emitter,
 		projectRoot: projectRoot,
 		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
 	}
 
 	// Wire event persistence: all events stored in SQLite.
@@ -208,6 +213,33 @@ func NewCoordinator(config *Config, projectRoot string) (*Coordinator, error) {
 				}
 				reg.Close()
 			}
+		}
+	}
+
+	// Register BitNet models in the broker so they route to the BitNet provider.
+	// Query the local BitNet server for its model ID.
+	if config.BitNet.Enabled {
+		bitnetURL := fmt.Sprintf("http://%s:%d/v1/models", config.BitNet.Host, config.BitNet.Port)
+		if resp, httpErr := (&http.Client{Timeout: 2 * time.Second}).Get(bitnetURL); httpErr == nil {
+			var modelList struct {
+				Data []struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			}
+			if decErr := json.NewDecoder(resp.Body).Decode(&modelList); decErr == nil {
+				for _, m := range modelList.Data {
+					c.infBroker.RegisterModel(&broker.ModelInfo{
+						ID:     m.ID,
+						Tier:   broker.TierLocal,
+						Source: "bitnet",
+						Pricing: broker.ModelPricing{
+							PromptPerMillion:     0,
+							CompletionPerMillion: 0,
+						},
+					})
+				}
+			}
+			resp.Body.Close()
 		}
 	}
 
@@ -654,7 +686,8 @@ func (c *Coordinator) checkBudget() {
 	}
 }
 
-// checkCompletion checks if all tasks are done and signals completion.
+// checkCompletion checks if all tasks are done, signals the orchestrator,
+// and closes the doneCh to notify the CLI run loop to exit.
 func (c *Coordinator) checkCompletion() {
 	tasks, err := c.db.ListTasks(state.TaskFilter{})
 	if err != nil || len(tasks) == 0 {
@@ -670,9 +703,25 @@ func (c *Coordinator) checkCompletion() {
 		}
 	}
 
-	if allDone && c.orchestratorMgr != nil {
-		c.orchestratorMgr.Complete()
+	if allDone {
+		if c.orchestratorMgr != nil {
+			c.orchestratorMgr.Complete()
+		}
+		// Signal the CLI run loop to exit. Use sync.Once semantics via
+		// select to avoid closing an already-closed channel.
+		select {
+		case <-c.doneCh:
+			// Already closed.
+		default:
+			close(c.doneCh)
+		}
 	}
+}
+
+// DoneCh returns a channel that is closed when all tasks have completed.
+// The CLI run loop selects on this channel to know when to exit gracefully.
+func (c *Coordinator) DoneCh() <-chan struct{} {
+	return c.doneCh
 }
 
 // Pause stops spawning new Meeseeks but lets running containers complete.
@@ -999,28 +1048,122 @@ func (c *Coordinator) dispatchReadyTasks() {
 	}
 }
 
+// defaultModelsForTier maps task tiers to their default model IDs.
+// See Architecture Section 10.2 for the tier-to-model mapping.
+var defaultModelsForTier = map[string]string{
+	"local":    "anthropic/claude-haiku-4.5",
+	"cheap":    "anthropic/claude-haiku-4.5",
+	"standard": "anthropic/claude-sonnet-4",
+	"premium":  "anthropic/claude-sonnet-4",
+}
+
+// modelForTier returns the model ID for a given task tier, taking into account
+// whether BitNet is available for local-tier tasks.
+// See Architecture Section 10.2 for the tier-to-model mapping.
+func (c *Coordinator) modelForTier(tier string) string {
+	// For local tier, check if BitNet is available and use it.
+	if tier == "local" && c.config.BitNet.Enabled {
+		// Query the BitNet server for available models.
+		bitnetModelID := c.getBitNetModelID()
+		if bitnetModelID != "" {
+			return bitnetModelID
+		}
+		// BitNet unavailable; fall back to cheapest cloud model.
+	}
+	if model, ok := defaultModelsForTier[tier]; ok {
+		return model
+	}
+	return "anthropic/claude-sonnet-4"
+}
+
+// getBitNetModelID queries the BitNet server for its model ID.
+// Returns empty string if BitNet is unavailable.
+func (c *Coordinator) getBitNetModelID() string {
+	if c.config.BitNet.Host == "" || c.config.BitNet.Port == 0 {
+		return ""
+	}
+	url := fmt.Sprintf("http://%s:%d/v1/models", c.config.BitNet.Host, c.config.BitNet.Port)
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Get(url)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || len(result.Data) == 0 {
+		return ""
+	}
+	return result.Data[0].ID
+}
+
+// modelFamilyFromID extracts the model family from a model ID (e.g. "anthropic" from "anthropic/claude-sonnet-4").
+func modelFamilyFromID(modelID string) string {
+	for i, c := range modelID {
+		if c == '/' {
+			return modelID[:i]
+		}
+	}
+	return "unknown"
+}
+
 // executeTaskInProcess runs a Meeseeks-equivalent task in the engine process
 // by calling the inference broker directly with the TaskSpec. This is the
 // fallback execution path when Docker containers are unavailable.
 //
 // The function:
-//  1. Builds a code-generation prompt from the TaskSpec
-//  2. Calls the inference broker (same path as container-based execution)
-//  3. Parses the response to extract code files
-//  4. Writes output + manifest.json to the staging directory
-//  5. Marks the task as done
+//  1. Selects the appropriate model based on task tier
+//  2. Records a task_attempt in the database
+//  3. Builds a code-generation prompt from the TaskSpec
+//  4. Calls the inference broker (same path as container-based execution)
+//  5. Parses the response to extract code files
+//  6. Writes output + manifest.json to the staging directory
+//  7. Updates the task_attempt with completion data
 //
 // All inference is routed through the broker for budget tracking and audit.
 func (c *Coordinator) executeTaskInProcess(task *state.Task, specContent, baseSnapshot, stagingDir string) {
+	// Select the model based on the task's tier per Architecture Section 10.2.
+	modelID := c.modelForTier(task.Tier)
+	modelFamily := modelFamilyFromID(modelID)
+
+	// Determine the attempt number for this task.
+	existingAttempts, _ := c.db.GetTaskAttempts(task.ID)
+	attemptNumber := len(existingAttempts) + 1
+
+	// Record the task attempt per Architecture Section 15.2.
+	now := time.Now()
+	attempt := &state.TaskAttempt{
+		TaskID:        task.ID,
+		AttemptNumber: attemptNumber,
+		ModelID:       modelID,
+		ModelFamily:   modelFamily,
+		BaseSnapshot:  baseSnapshot,
+		Status:        "running",
+		StartedAt:     now,
+	}
+	if err := c.db.InsertTaskAttempt(attempt); err != nil {
+		c.emitter.Emit(events.Event{
+			Type:   events.EventTaskFailed,
+			TaskID: task.ID,
+			Details: map[string]interface{}{
+				"error": fmt.Sprintf("insert task attempt: %v", err),
+			},
+		})
+	}
+
 	c.emitter.Emit(events.Event{
 		Type:      events.EventContainerSpawned,
 		TaskID:    task.ID,
 		AgentType: "meeseeks",
 		AgentID:   "direct-" + task.ID,
 		Details: map[string]interface{}{
-			"mode":  "in_process",
-			"tier":  task.Tier,
-			"model": "anthropic/claude-sonnet-4",
+			"mode":    "in_process",
+			"tier":    task.Tier,
+			"model":   modelID,
+			"attempt": attemptNumber,
 		},
 	})
 
@@ -1041,7 +1184,7 @@ Create all files needed to complete the task.`, specContent)
 
 	resp, err := c.infBroker.RouteRequest(context.Background(), &broker.InferenceRequest{
 		TaskID:    task.ID,
-		ModelID:   "anthropic/claude-sonnet-4",
+		ModelID:   modelID,
 		AgentType: "meeseeks",
 		Messages: []broker.ChatMessage{
 			{Role: "system", Content: "You are a precise code generation agent. You produce working, production-ready code. Output only valid JSON with file paths and contents."},
@@ -1051,6 +1194,10 @@ Create all files needed to complete the task.`, specContent)
 		Temperature: 0.2,
 	})
 	if err != nil {
+		// Record the failed attempt.
+		if attempt.ID > 0 {
+			_ = c.db.UpdateTaskAttemptStatus(attempt.ID, "failed", err.Error())
+		}
 		c.emitter.Emit(events.Event{
 			Type:   events.EventTaskFailed,
 			TaskID: task.ID,
@@ -1065,6 +1212,10 @@ Create all files needed to complete the task.`, specContent)
 	// Parse the response to extract files.
 	files := parseCodeResponse(resp.Content)
 	if len(files) == 0 {
+		// Record the failed attempt.
+		if attempt.ID > 0 {
+			_ = c.db.UpdateTaskAttemptStatus(attempt.ID, "failed", "no files produced")
+		}
 		c.emitter.Emit(events.Event{
 			Type:   events.EventTaskFailed,
 			TaskID: task.ID,
@@ -1075,6 +1226,16 @@ Create all files needed to complete the task.`, specContent)
 		})
 		c.requeueTask(task.ID)
 		return
+	}
+
+	// Update the attempt with completion data.
+	if attempt.ID > 0 {
+		costUSD := 0.0
+		if resp.InputTokens > 0 || resp.OutputTokens > 0 {
+			// Estimate cost from broker's tracked data (already logged in cost_log).
+			costUSD = float64(resp.InputTokens)*3.0/1_000_000 + float64(resp.OutputTokens)*15.0/1_000_000
+		}
+		_ = c.db.UpdateTaskAttemptCompleted(attempt.ID, "passed", resp.InputTokens, resp.OutputTokens, costUSD)
 	}
 
 	// Write output files to staging directory.
@@ -1123,6 +1284,28 @@ Create all files needed to complete the task.`, specContent)
 		return
 	}
 
+	// Run in-process validation before submitting to merge queue.
+	// This replaces the full container-based validation sandbox (Stage 2
+	// of Architecture Section 14.2) with a lighter-weight in-process check
+	// that catches compilation errors, duplicate definitions, and interface
+	// mismatches before they reach the merge queue.
+	validationErr := c.validateInProcessOutput(task, files, attempt)
+	if validationErr != nil {
+		if attempt.ID > 0 {
+			_ = c.db.UpdateTaskAttemptStatus(attempt.ID, "failed", validationErr.Error())
+		}
+		c.emitter.Emit(events.Event{
+			Type:   events.EventTaskFailed,
+			TaskID: task.ID,
+			Details: map[string]interface{}{
+				"error":  fmt.Sprintf("validation failed: %v", validationErr),
+				"stage":  "in_process_validation",
+			},
+		})
+		c.requeueTask(task.ID)
+		return
+	}
+
 	// Re-read HEAD SHA just before submitting to the merge queue.
 	// In-process execution runs in a goroutine and other tasks may have
 	// committed while the inference call was in-flight. Using the current
@@ -1133,17 +1316,18 @@ Create all files needed to complete the task.`, specContent)
 		currentHead = baseSnapshot // fall back to original if git fails
 	}
 
-	// Submit to the merge queue directly. In a full pipeline, this would go
-	// through the approval pipeline (validation sandbox -> reviewer ->
-	// orchestrator -> merge queue).
+	// Submit to the merge queue.
 	srsRefs, _ := c.db.GetTaskSRSRefs(task.ID)
 	mergeItem := &merge.MergeItem{
-		TaskID:       task.ID,
-		TaskTitle:    task.Title,
-		StagingDir:   stagingDir,
-		BaseSnapshot: currentHead,
-		Files:        files,
-		SRSRefs:      srsRefs,
+		TaskID:        task.ID,
+		TaskTitle:     task.Title,
+		StagingDir:    stagingDir,
+		BaseSnapshot:  currentHead,
+		Files:         files,
+		SRSRefs:       srsRefs,
+		MeeseeksModel: modelID,
+		AttemptNumber: attemptNumber,
+		MaxAttempts:   3,
 	}
 	c.mergeQueue.Submit(mergeItem)
 
@@ -1213,6 +1397,180 @@ func buildManifest(taskID, baseSnapshot string, files map[string]string) map[str
 			"renamed":  []interface{}{},
 		},
 	}
+}
+
+// validateInProcessOutput performs lightweight validation on in-process task
+// output before it reaches the merge queue. This is the in-process equivalent
+// of the validation sandbox (Stage 2 of Architecture Section 14.2).
+//
+// It creates a temporary directory overlaying the current project with the
+// task's output files, then runs language-appropriate build checks. This
+// catches compilation errors, duplicate definitions, and interface mismatches
+// that would otherwise be merged into the codebase.
+func (c *Coordinator) validateInProcessOutput(task *state.Task, files map[string]string, attempt *state.TaskAttempt) error {
+	// Create a temporary validation directory with the project + task output.
+	tmpDir, err := os.MkdirTemp("", "axiom-validate-"+task.ID+"-")
+	if err != nil {
+		return fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Copy current project files to the temp directory.
+	copyCmd := exec.Command("cp", "-a", c.projectRoot+"/.", tmpDir+"/")
+	if output, cpErr := copyCmd.CombinedOutput(); cpErr != nil {
+		return fmt.Errorf("copy project: %s: %w", string(output), cpErr)
+	}
+
+	// Remove .axiom dir from the copy (not needed for validation).
+	os.RemoveAll(filepath.Join(tmpDir, ".axiom"))
+
+	// Overlay the task output files.
+	for filePath, content := range files {
+		fullPath := filepath.Join(tmpDir, filePath)
+		if mkErr := os.MkdirAll(filepath.Dir(fullPath), 0755); mkErr != nil {
+			return fmt.Errorf("mkdir for %s: %w", filePath, mkErr)
+		}
+		if wErr := os.WriteFile(fullPath, []byte(content), 0644); wErr != nil {
+			return fmt.Errorf("write %s: %w", filePath, wErr)
+		}
+	}
+
+	// Detect project language and run appropriate build check.
+	if _, err := os.Stat(filepath.Join(tmpDir, "go.mod")); err == nil {
+		return c.validateGo(tmpDir, task, attempt)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "package.json")); err == nil {
+		return c.validateNode(tmpDir, task, attempt)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "requirements.txt")); err == nil {
+		return c.validatePython(tmpDir, task, attempt)
+	}
+
+	// No recognized project type; skip validation.
+	return nil
+}
+
+// validateGo runs `go build ./...` and `go vet ./...` on the temporary project.
+func (c *Coordinator) validateGo(tmpDir string, task *state.Task, attempt *state.TaskAttempt) error {
+	start := time.Now()
+
+	// Run go build.
+	buildCmd := exec.Command("go", "build", "./...")
+	buildCmd.Dir = tmpDir
+	buildCmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod")
+	output, err := buildCmd.CombinedOutput()
+	duration := time.Since(start)
+
+	// Record validation run in database.
+	status := "pass"
+	outputStr := ""
+	if err != nil {
+		status = "fail"
+		outputStr = strings.TrimSpace(string(output))
+	}
+	if attempt != nil && attempt.ID > 0 {
+		_ = c.db.InsertValidationRun(&state.ValidationRun{
+			AttemptID:  attempt.ID,
+			CheckType:  "compile",
+			Status:     status,
+			Output:     outputStr,
+			DurationMs: int(duration.Milliseconds()),
+			Timestamp:  time.Now(),
+		})
+	}
+
+	if err != nil {
+		return fmt.Errorf("go build failed:\n%s", outputStr)
+	}
+
+	// Run go vet (non-blocking; emit warning but don't fail).
+	vetCmd := exec.Command("go", "vet", "./...")
+	vetCmd.Dir = tmpDir
+	vetCmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod")
+	vetOutput, vetErr := vetCmd.CombinedOutput()
+	vetStatus := "pass"
+	vetOutputStr := ""
+	if vetErr != nil {
+		vetStatus = "fail"
+		vetOutputStr = strings.TrimSpace(string(vetOutput))
+	}
+	if attempt != nil && attempt.ID > 0 {
+		_ = c.db.InsertValidationRun(&state.ValidationRun{
+			AttemptID:  attempt.ID,
+			CheckType:  "lint",
+			Status:     vetStatus,
+			Output:     vetOutputStr,
+			DurationMs: int(time.Since(start).Milliseconds()),
+			Timestamp:  time.Now(),
+		})
+	}
+
+	return nil
+}
+
+// validateNode runs a syntax check on Node.js projects.
+func (c *Coordinator) validateNode(tmpDir string, task *state.Task, attempt *state.TaskAttempt) error {
+	// Check if node is available.
+	if _, err := exec.LookPath("node"); err != nil {
+		return nil // Node not available; skip.
+	}
+
+	start := time.Now()
+	checkCmd := exec.Command("node", "--check", ".")
+	checkCmd.Dir = tmpDir
+	output, err := checkCmd.CombinedOutput()
+	if attempt != nil && attempt.ID > 0 {
+		status := "pass"
+		outputStr := ""
+		if err != nil {
+			status = "fail"
+			outputStr = strings.TrimSpace(string(output))
+		}
+		_ = c.db.InsertValidationRun(&state.ValidationRun{
+			AttemptID:  attempt.ID,
+			CheckType:  "compile",
+			Status:     status,
+			Output:     outputStr,
+			DurationMs: int(time.Since(start).Milliseconds()),
+			Timestamp:  time.Now(),
+		})
+	}
+	if err != nil {
+		return fmt.Errorf("node syntax check failed:\n%s", strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// validatePython runs a syntax check on Python projects.
+func (c *Coordinator) validatePython(tmpDir string, task *state.Task, attempt *state.TaskAttempt) error {
+	if _, err := exec.LookPath("python3"); err != nil {
+		return nil // Python not available; skip.
+	}
+
+	start := time.Now()
+	checkCmd := exec.Command("python3", "-m", "py_compile", ".")
+	checkCmd.Dir = tmpDir
+	output, err := checkCmd.CombinedOutput()
+	if attempt != nil && attempt.ID > 0 {
+		status := "pass"
+		outputStr := ""
+		if err != nil {
+			status = "fail"
+			outputStr = strings.TrimSpace(string(output))
+		}
+		_ = c.db.InsertValidationRun(&state.ValidationRun{
+			AttemptID:  attempt.ID,
+			CheckType:  "compile",
+			Status:     status,
+			Output:     outputStr,
+			DurationMs: int(time.Since(start).Milliseconds()),
+			Timestamp:  time.Now(),
+		})
+	}
+	if err != nil {
+		return fmt.Errorf("python syntax check failed:\n%s", strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 // buildMergeItem reads staged files and constructs a MergeItem for submission
@@ -1389,6 +1747,21 @@ func (c *Coordinator) StartOrchestrator(ctx context.Context, prompt string) erro
 
 	runtime := c.config.Orchestrator.Runtime
 
+	// Create the project branch per Architecture Section 23.1.
+	// All task commits go to axiom/<project-slug>, never to the user's branch.
+	branchName, err := c.gitMgr.CreateProjectBranch(projectID)
+	if err != nil {
+		return fmt.Errorf("create project branch: %w", err)
+	}
+	c.emitter.Emit(events.Event{
+		Type:      events.EventTaskCreated,
+		AgentType: "engine",
+		Details: map[string]interface{}{
+			"action": "project_branch_created",
+			"branch": branchName,
+		},
+	})
+
 	// Try embedded orchestrator if Docker is available and runtime supports it.
 	if c.containerMgr != nil && runtime != "claw" {
 		c.orchestratorMgr = orchestrator.NewEmbedded(
@@ -1428,9 +1801,10 @@ func (c *Coordinator) StartOrchestrator(ctx context.Context, prompt string) erro
 	// This runs in-process without Docker containers.
 	directOrch := orchestrator.NewDirect(
 		orchestrator.DirectConfig{
-			Runtime:     orchestrator.Runtime(runtime),
-			BudgetUSD:   c.config.Budget.MaxUSD,
-			ProjectSlug: projectID,
+			Runtime:             orchestrator.Runtime(runtime),
+			BudgetUSD:           c.config.Budget.MaxUSD,
+			ProjectSlug:         projectID,
+			SRSApprovalDelegate: c.config.Orchestrator.SRSApprovalDelegate,
 		},
 		c.infBroker,
 		c.db,
@@ -1441,6 +1815,10 @@ func (c *Coordinator) StartOrchestrator(ctx context.Context, prompt string) erro
 	if err := directOrch.Start(ctx, projectID, prompt, isGreenfield); err != nil {
 		return fmt.Errorf("start direct orchestrator: %w", err)
 	}
+
+	// Store the direct orchestrator so checkCompletion() can signal it
+	// and the coordinator can manage its lifecycle (BUG-027 fix).
+	c.orchestratorMgr = directOrch
 
 	c.emitter.Emit(events.Event{
 		Type:      events.EventContainerSpawned,
