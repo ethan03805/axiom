@@ -26,6 +26,7 @@ type EventFilter struct {
 
 // InsertEvent persists an event to the database.
 func (db *DB) InsertEvent(event *Event) error {
+	db.wmu.Lock()
 	result, err := db.conn.Exec(
 		`INSERT INTO events (event_type, task_id, agent_type, agent_id, details, timestamp)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
@@ -33,6 +34,7 @@ func (db *DB) InsertEvent(event *Event) error {
 		nullString(event.AgentType), nullString(event.AgentID),
 		event.Details, event.Timestamp,
 	)
+	db.wmu.Unlock()
 	if err != nil {
 		return fmt.Errorf("insert event: %w", err)
 	}

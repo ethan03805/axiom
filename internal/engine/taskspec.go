@@ -40,15 +40,16 @@ const (
 // TaskSpecRequest contains the parameters needed to build a TaskSpec.
 // The orchestrator populates this when requesting a Meeseeks spawn.
 type TaskSpecRequest struct {
-	Task         *state.Task
-	ContextTier  ContextTier
-	SRSRefs      []string          // SRS requirements this task addresses
-	TargetFiles  []string          // Files the Meeseeks will modify
-	Dependencies []string          // Task IDs this task depends on
-	Constraints  TaskConstraints
-	AcceptCriteria []string        // Specific testable criteria
-	Feedback     string            // Feedback from a prior failed attempt
-	AttemptNumber int
+	Task               *state.Task
+	ContextTier        ContextTier
+	SRSRefs            []string          // SRS requirements this task addresses
+	TargetFiles        []string          // Files the Meeseeks will modify
+	Dependencies       []string          // Task IDs this task depends on
+	ImplementationFiles map[string]string // For test tasks: actual source files from dependencies
+	Constraints        TaskConstraints
+	AcceptCriteria     []string        // Specific testable criteria
+	Feedback           string            // Feedback from a prior failed attempt
+	AttemptNumber      int
 }
 
 // TaskConstraints holds coding constraints for the Meeseeks.
@@ -176,6 +177,10 @@ func (b *TaskSpecBuilder) Build(req *TaskSpecRequest, baseSnapshot string) (stri
 
 // gatherContext builds the context section based on the requested tier.
 // It queries the semantic index and applies security mitigations.
+//
+// For test-generation tasks (task_type == "test"), implementation source files
+// from dependency tasks are included as context per Architecture Section 11.5.
+// Test Meeseeks need the actual committed implementation to write valid tests.
 func (b *TaskSpecBuilder) gatherContext(req *TaskSpecRequest) (string, error) {
 	var ctx strings.Builder
 
@@ -212,6 +217,22 @@ func (b *TaskSpecBuilder) gatherContext(req *TaskSpecRequest) (string, error) {
 	default:
 		ctx.WriteString("### Context\n")
 		ctx.WriteString("Default context for this task.\n\n")
+	}
+
+	// For test-generation tasks, include the actual implementation source files
+	// as additional context. This ensures tests reference real functions, types,
+	// and interfaces rather than hallucinated ones.
+	// See Architecture Section 11.5: test generation tasks should have the
+	// semantic index of the committed implementation as context.
+	if len(req.ImplementationFiles) > 0 {
+		ctx.WriteString("### Implementation Source (for test generation)\n")
+		ctx.WriteString("The following are the ACTUAL implementation files your tests must reference.\n")
+		ctx.WriteString("Use only the functions, types, and exports defined in these files.\n\n")
+		for filePath, content := range req.ImplementationFiles {
+			ctx.WriteString(fmt.Sprintf("<untrusted_repo_content source=%q>\n", filePath))
+			ctx.WriteString(content)
+			ctx.WriteString("\n</untrusted_repo_content>\n\n")
+		}
 	}
 
 	return ctx.String(), nil

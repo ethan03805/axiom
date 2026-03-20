@@ -25,7 +25,7 @@ var validTransitions = map[TaskStatus][]TaskStatus{
 	TaskStatusQueued:       {TaskStatusInProgress},
 	TaskStatusInProgress:   {TaskStatusInReview, TaskStatusFailed, TaskStatusBlocked, TaskStatusWaitingOnLock},
 	TaskStatusInReview:     {TaskStatusDone, TaskStatusFailed, TaskStatusBlocked},
-	TaskStatusFailed:       {TaskStatusQueued},
+	TaskStatusFailed:       {TaskStatusQueued, TaskStatusBlocked},
 	TaskStatusWaitingOnLock: {TaskStatusQueued},
 }
 
@@ -48,6 +48,8 @@ type TaskFilter struct {
 
 // CreateTask inserts a new task into the database.
 func (db *DB) CreateTask(task *Task) error {
+	db.wmu.Lock()
+	defer db.wmu.Unlock()
 	_, err := db.conn.Exec(
 		`INSERT INTO tasks (id, parent_id, title, description, status, tier, task_type, base_snapshot, eco_ref, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -165,7 +167,10 @@ func (db *DB) ListTasks(filter TaskFilter) ([]*Task, error) {
 }
 
 // UpdateTaskStatus updates a task's status with state machine validation.
+// Uses the write mutex to serialize status transitions during concurrent dispatch.
 func (db *DB) UpdateTaskStatus(id string, status TaskStatus) error {
+	db.wmu.Lock()
+	defer db.wmu.Unlock()
 	// Get current status
 	var currentStatus string
 	err := db.conn.QueryRow("SELECT status FROM tasks WHERE id = ?", id).Scan(&currentStatus)

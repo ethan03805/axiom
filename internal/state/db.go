@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -12,8 +13,13 @@ import (
 var schemaFS embed.FS
 
 // DB wraps a sql.DB with Axiom-specific state operations.
+// It includes a write mutex to serialize SQLite writes, preventing SQLITE_BUSY
+// errors when multiple goroutines dispatch tasks concurrently. SQLite WAL mode
+// supports concurrent reads but still serializes writes; the mutex ensures
+// writes are serialized at the Go level before reaching SQLite.
 type DB struct {
 	conn *sql.DB
+	wmu  sync.Mutex // serializes all write operations
 }
 
 // NewDB opens a SQLite database at dbPath with WAL mode, busy timeout,
@@ -30,7 +36,8 @@ func NewDB(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("set WAL mode: %w", err)
 	}
 
-	// Busy timeout so concurrent writers wait instead of failing immediately
+	// Busy timeout so concurrent writers wait instead of failing immediately.
+	// This is a safety net in case the write mutex is bypassed via Conn().
 	if _, err := conn.Exec("PRAGMA busy_timeout=5000"); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("set busy_timeout: %w", err)
@@ -47,12 +54,22 @@ func NewDB(dbPath string) (*DB, error) {
 	return &DB{conn: conn}, nil
 }
 
+// WriteExec serializes a write operation through the write mutex.
+// All INSERT/UPDATE/DELETE operations should use this to prevent SQLITE_BUSY.
+func (db *DB) WriteExec(query string, args ...interface{}) (sql.Result, error) {
+	db.wmu.Lock()
+	defer db.wmu.Unlock()
+	return db.conn.Exec(query, args...)
+}
+
 // RunMigrations reads and executes the embedded initial schema SQL.
 func (db *DB) RunMigrations() error {
 	schema, err := schemaFS.ReadFile("schemas/001_initial.sql")
 	if err != nil {
 		return fmt.Errorf("read migration: %w", err)
 	}
+	db.wmu.Lock()
+	defer db.wmu.Unlock()
 	if _, err := db.conn.Exec(string(schema)); err != nil {
 		return fmt.Errorf("exec migration: %w", err)
 	}

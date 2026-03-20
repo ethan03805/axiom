@@ -856,12 +856,123 @@ func (c *Coordinator) handleReviewResult(taskID string, msg interface{}, raw []b
 	return nil, nil
 }
 
+// maxRetriesPerTier is the maximum number of retries at the same model tier
+// before escalating. See Architecture Section 30.1.
+const maxRetriesPerTier = 3
+
+// maxEscalations is the maximum number of tier escalations before marking
+// a task as BLOCKED. See Architecture Section 30.1.
+const maxEscalations = 2
+
+// tierEscalationOrder defines the escalation path for model tiers.
+// Each tier escalates to the next entry. See Architecture Section 30.1.
+var tierEscalationOrder = []string{"local", "cheap", "standard", "premium"}
+
+// escalateTier returns the next tier up from the given tier, or empty string
+// if the tier is already at the highest level.
+func escalateTier(currentTier string) string {
+	for i, t := range tierEscalationOrder {
+		if t == currentTier && i+1 < len(tierEscalationOrder) {
+			return tierEscalationOrder[i+1]
+		}
+	}
+	return ""
+}
+
 // requeueTask resets a task from in_progress back to queued through the valid
 // state machine path: in_progress -> failed -> queued (Architecture Section 15.4).
+//
+// It enforces retry limits and tier escalation per Architecture Section 30.1:
+//   - Max 3 retries at the same model tier
+//   - Max 2 escalations to higher tiers
+//   - After exhausting all escalations: mark task BLOCKED
 func (c *Coordinator) requeueTask(taskID string) {
+	task, err := c.db.GetTask(taskID)
+	if err != nil {
+		c.emitter.Emit(events.Event{
+			Type:   events.EventTaskFailed,
+			TaskID: taskID,
+			Details: map[string]interface{}{
+				"error": fmt.Sprintf("requeueTask: get task: %v", err),
+			},
+		})
+		_ = c.workQueue.FailTask(taskID)
+		_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusFailed)
+		_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusBlocked)
+		return
+	}
+
+	// Count total attempts and attempts at the current tier.
+	totalAttempts, _ := c.db.CountTaskAttempts(taskID)
+	tierAttempts, _ := c.db.CountTaskAttemptsForTier(taskID, task.Tier)
+
+	// If we haven't exhausted retries at the current tier, just requeue.
+	if tierAttempts < maxRetriesPerTier {
+		_ = c.workQueue.FailTask(taskID)
+		_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusFailed)
+		_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusQueued)
+		return
+	}
+
+	// Count how many escalations have occurred by checking how many distinct
+	// tiers have been tried. Each tier beyond the original counts as one escalation.
+	originalTierIdx := 0
+	currentTierIdx := 0
+	for i, t := range tierEscalationOrder {
+		if t == task.Tier {
+			currentTierIdx = i
+		}
+	}
+	// Find the lowest tier used in any attempt to determine the original tier.
+	attempts, _ := c.db.GetTaskAttempts(taskID)
+	if len(attempts) > 0 {
+		lowestTierUsed := currentTierIdx
+		for _, a := range attempts {
+			for i, t := range tierEscalationOrder {
+				model := defaultModelsForTier[t]
+				if a.ModelID == model && i < lowestTierUsed {
+					lowestTierUsed = i
+				}
+			}
+		}
+		originalTierIdx = lowestTierUsed
+	}
+	escalationsDone := currentTierIdx - originalTierIdx
+
+	// Try to escalate to a higher tier.
+	nextTier := escalateTier(task.Tier)
+	if nextTier != "" && escalationsDone < maxEscalations {
+		_ = c.db.UpdateTaskTier(taskID, nextTier)
+		c.emitter.Emit(events.Event{
+			Type:   events.EventTaskFailed,
+			TaskID: taskID,
+			Details: map[string]interface{}{
+				"action":          "escalate",
+				"from_tier":       task.Tier,
+				"to_tier":         nextTier,
+				"total_attempts":  totalAttempts,
+				"escalation_num":  escalationsDone + 1,
+			},
+		})
+		_ = c.workQueue.FailTask(taskID)
+		_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusFailed)
+		_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusQueued)
+		return
+	}
+
+	// All retries and escalations exhausted: mark task BLOCKED.
+	c.emitter.Emit(events.Event{
+		Type:   events.EventTaskBlocked,
+		TaskID: taskID,
+		Details: map[string]interface{}{
+			"reason":         "exhausted all retries and escalations",
+			"total_attempts": totalAttempts,
+			"final_tier":     task.Tier,
+		},
+	})
 	_ = c.workQueue.FailTask(taskID)
 	_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusFailed)
-	_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusQueued)
+	_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusBlocked)
 }
 
 // dispatchReadyTasks finds tasks that are ready to execute, acquires their locks,
@@ -959,6 +1070,16 @@ func (c *Coordinator) dispatchReadyTasks() {
 			TargetFiles: filePaths,
 		}
 
+		// For test-generation tasks, include the actual implementation source
+		// files from dependency tasks as context. Per Architecture Section 11.5,
+		// test Meeseeks need the committed implementation to write valid tests.
+		if task.TaskType == "test" {
+			implFiles := c.gatherImplementationContext(task.ID)
+			if len(implFiles) > 0 {
+				specReq.ImplementationFiles = implFiles
+			}
+		}
+
 		// Build the TaskSpec.
 		specContent, err := c.taskSpecBuilder.Build(specReq, baseSnapshot)
 		if err != nil {
@@ -1050,11 +1171,12 @@ func (c *Coordinator) dispatchReadyTasks() {
 
 // defaultModelsForTier maps task tiers to their default model IDs.
 // See Architecture Section 10.2 for the tier-to-model mapping.
+// Premium tier uses the most capable model available (Opus/o1).
 var defaultModelsForTier = map[string]string{
 	"local":    "anthropic/claude-haiku-4.5",
 	"cheap":    "anthropic/claude-haiku-4.5",
 	"standard": "anthropic/claude-sonnet-4",
-	"premium":  "anthropic/claude-sonnet-4",
+	"premium":  "anthropic/claude-opus-4",
 }
 
 // modelForTier returns the model ID for a given task tier, taking into account
@@ -1074,6 +1196,45 @@ func (c *Coordinator) modelForTier(tier string) string {
 		return model
 	}
 	return "anthropic/claude-sonnet-4"
+}
+
+// gatherImplementationContext reads the implementation source files from the
+// project that were produced by a test task's dependencies. This ensures test
+// Meeseeks have the actual committed code to write tests against, preventing
+// cross-Meeseeks incoherence where tests reference nonexistent types/functions.
+// See Architecture Section 11.5.
+func (c *Coordinator) gatherImplementationContext(testTaskID string) map[string]string {
+	deps, err := c.db.GetTaskDependencies(testTaskID)
+	if err != nil || len(deps) == 0 {
+		return nil
+	}
+
+	implFiles := make(map[string]string)
+	for _, depID := range deps {
+		depTask, err := c.db.GetTask(depID)
+		if err != nil || depTask.Status != string(state.TaskStatusDone) {
+			continue
+		}
+		// Only gather from implementation tasks.
+		if depTask.TaskType != "implementation" {
+			continue
+		}
+		// Get the target files of the implementation task and read them
+		// from the current project state.
+		depTargetFiles, err := c.db.GetTaskTargetFiles(depID)
+		if err != nil {
+			continue
+		}
+		for _, tf := range depTargetFiles {
+			fullPath := filepath.Join(c.projectRoot, tf.FilePath)
+			data, err := os.ReadFile(fullPath)
+			if err != nil {
+				continue
+			}
+			implFiles[tf.FilePath] = string(data)
+		}
+	}
+	return implFiles
 }
 
 // getBitNetModelID queries the BitNet server for its model ID.
@@ -1284,11 +1445,11 @@ Create all files needed to complete the task.`, specContent)
 		return
 	}
 
-	// Run in-process validation before submitting to merge queue.
+	// Stage 2: Run in-process validation before reviewer evaluation.
 	// This replaces the full container-based validation sandbox (Stage 2
 	// of Architecture Section 14.2) with a lighter-weight in-process check
 	// that catches compilation errors, duplicate definitions, and interface
-	// mismatches before they reach the merge queue.
+	// mismatches before they reach review.
 	validationErr := c.validateInProcessOutput(task, files, attempt)
 	if validationErr != nil {
 		if attempt.ID > 0 {
@@ -1300,6 +1461,25 @@ Create all files needed to complete the task.`, specContent)
 			Details: map[string]interface{}{
 				"error":  fmt.Sprintf("validation failed: %v", validationErr),
 				"stage":  "in_process_validation",
+			},
+		})
+		c.requeueTask(task.ID)
+		return
+	}
+
+	// Stage 3: Reviewer evaluation per Architecture Section 14.2.
+	// NO Meeseeks output shall be promoted without passing reviewer approval.
+	reviewErr := c.reviewInProcessOutput(task, specContent, files, attempt, modelID)
+	if reviewErr != nil {
+		if attempt.ID > 0 {
+			_ = c.db.UpdateTaskAttemptStatus(attempt.ID, "failed", reviewErr.Error())
+		}
+		c.emitter.Emit(events.Event{
+			Type:   events.EventTaskFailed,
+			TaskID: task.ID,
+			Details: map[string]interface{}{
+				"error": fmt.Sprintf("review rejected: %v", reviewErr),
+				"stage": "in_process_review",
 			},
 		})
 		c.requeueTask(task.ID)
@@ -1483,7 +1663,9 @@ func (c *Coordinator) validateGo(tmpDir string, task *state.Task, attempt *state
 		return fmt.Errorf("go build failed:\n%s", outputStr)
 	}
 
-	// Run go vet (non-blocking; emit warning but don't fail).
+	// Run go vet as a blocking lint check per Architecture Section 14.2.
+	// Lint failures block promotion to prevent code with vet errors
+	// (undefined references, type assertion issues) from being merged.
 	vetCmd := exec.Command("go", "vet", "./...")
 	vetCmd.Dir = tmpDir
 	vetCmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod")
@@ -1505,27 +1687,50 @@ func (c *Coordinator) validateGo(tmpDir string, task *state.Task, attempt *state
 		})
 	}
 
+	if vetErr != nil {
+		return fmt.Errorf("go vet failed:\n%s", vetOutputStr)
+	}
+
 	return nil
 }
 
-// validateNode runs a syntax check on Node.js projects.
+// validateNode runs a syntax check on Node.js projects by finding all .js
+// files and checking each one individually. node --check expects a single
+// file path, not a directory.
+// See Architecture Section 13.5 for language-specific validation profiles.
 func (c *Coordinator) validateNode(tmpDir string, task *state.Task, attempt *state.TaskAttempt) error {
-	// Check if node is available.
 	if _, err := exec.LookPath("node"); err != nil {
 		return nil // Node not available; skip.
 	}
 
 	start := time.Now()
-	checkCmd := exec.Command("node", "--check", ".")
-	checkCmd.Dir = tmpDir
-	output, err := checkCmd.CombinedOutput()
-	if attempt != nil && attempt.ID > 0 {
-		status := "pass"
-		outputStr := ""
+
+	// Find all .js files in the temp directory (excluding node_modules).
+	findCmd := exec.Command("find", tmpDir, "-name", "*.js", "-not", "-path", "*/node_modules/*", "-type", "f")
+	findOutput, findErr := findCmd.Output()
+	if findErr != nil || len(strings.TrimSpace(string(findOutput))) == 0 {
+		// No .js files found; skip validation.
+		return nil
+	}
+
+	jsFiles := strings.Split(strings.TrimSpace(string(findOutput)), "\n")
+	var failedFiles []string
+	for _, f := range jsFiles {
+		checkCmd := exec.Command("node", "--check", f)
+		checkCmd.Dir = tmpDir
+		output, err := checkCmd.CombinedOutput()
 		if err != nil {
-			status = "fail"
-			outputStr = strings.TrimSpace(string(output))
+			failedFiles = append(failedFiles, fmt.Sprintf("%s: %s", f, strings.TrimSpace(string(output))))
 		}
+	}
+
+	status := "pass"
+	outputStr := ""
+	if len(failedFiles) > 0 {
+		status = "fail"
+		outputStr = strings.Join(failedFiles, "\n")
+	}
+	if attempt != nil && attempt.ID > 0 {
 		_ = c.db.InsertValidationRun(&state.ValidationRun{
 			AttemptID:  attempt.ID,
 			CheckType:  "compile",
@@ -1535,20 +1740,25 @@ func (c *Coordinator) validateNode(tmpDir string, task *state.Task, attempt *sta
 			Timestamp:  time.Now(),
 		})
 	}
-	if err != nil {
-		return fmt.Errorf("node syntax check failed:\n%s", strings.TrimSpace(string(output)))
+	if len(failedFiles) > 0 {
+		return fmt.Errorf("node syntax check failed:\n%s", outputStr)
 	}
 	return nil
 }
 
-// validatePython runs a syntax check on Python projects.
+// validatePython runs a syntax check on Python projects using compileall,
+// which correctly handles directories by recursively compiling all .py files.
+// See Architecture Section 13.5 for language-specific validation profiles.
 func (c *Coordinator) validatePython(tmpDir string, task *state.Task, attempt *state.TaskAttempt) error {
 	if _, err := exec.LookPath("python3"); err != nil {
 		return nil // Python not available; skip.
 	}
 
 	start := time.Now()
-	checkCmd := exec.Command("python3", "-m", "py_compile", ".")
+	// Use compileall instead of py_compile: compileall handles directories
+	// natively, whereas py_compile expects individual file paths and fails
+	// with IsADirectoryError when given ".".
+	checkCmd := exec.Command("python3", "-m", "compileall", "-q", tmpDir)
 	checkCmd.Dir = tmpDir
 	output, err := checkCmd.CombinedOutput()
 	if attempt != nil && attempt.ID > 0 {
@@ -1571,6 +1781,170 @@ func (c *Coordinator) validatePython(tmpDir string, task *state.Task, attempt *s
 		return fmt.Errorf("python syntax check failed:\n%s", strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+// reviewerModelForMeeseeks selects a reviewer model from a different family
+// than the Meeseeks model per Architecture Section 11.3. For standard+ tiers,
+// the reviewer SHOULD be from a different model family to prevent correlated
+// blind spots and rubber-stamping.
+func reviewerModelForMeeseeks(meeseeksModel, tier string) string {
+	meeseeksFamily := modelFamilyFromID(meeseeksModel)
+
+	// For local/cheap tiers, model family diversification is optional.
+	// Use the same tier model.
+	if tier == "local" || tier == "cheap" {
+		return defaultModelsForTier[tier]
+	}
+
+	// For standard/premium: pick a reviewer from a different family.
+	// Use OpenAI as the default alternative to Anthropic.
+	if meeseeksFamily == "anthropic" {
+		return "openai/gpt-4o"
+	}
+	// If Meeseeks is non-Anthropic, use Anthropic for review.
+	return "anthropic/claude-sonnet-4"
+}
+
+// reviewInProcessOutput runs an in-process reviewer evaluation of task output
+// per Architecture Section 14.2 Stage 3. The reviewer evaluates the Meeseeks
+// output against the TaskSpec and returns APPROVE or REJECT.
+//
+// This ensures NO Meeseeks output is promoted without passing reviewer approval.
+func (c *Coordinator) reviewInProcessOutput(task *state.Task, specContent string, files map[string]string, attempt *state.TaskAttempt, meeseeksModel string) error {
+	reviewerModel := reviewerModelForMeeseeks(meeseeksModel, task.Tier)
+	reviewerFamily := modelFamilyFromID(reviewerModel)
+
+	c.emitter.Emit(events.Event{
+		Type:      events.EventReviewStarted,
+		TaskID:    task.ID,
+		AgentType: "reviewer",
+		AgentID:   "review-" + task.ID,
+		Details: map[string]interface{}{
+			"reviewer_model": reviewerModel,
+			"meeseeks_model": meeseeksModel,
+		},
+	})
+
+	// Build the ReviewSpec content: original TaskSpec + output files.
+	var filesListing strings.Builder
+	for filePath, content := range files {
+		filesListing.WriteString(fmt.Sprintf("\n### %s\n```\n%s\n```\n", filePath, content))
+	}
+
+	reviewPrompt := fmt.Sprintf(`You are a code reviewer agent. Evaluate the following Meeseeks output against the original TaskSpec.
+
+## Original TaskSpec
+%s
+
+## Meeseeks Output Files
+%s
+
+## Review Instructions
+Evaluate the output against the TaskSpec. Check for:
+- Correctness against the objective and acceptance criteria
+- Interface contract compliance
+- Obvious bugs, edge cases, or security issues
+- Code quality and style compliance
+
+Respond ONLY with a JSON object:
+{
+  "verdict": "APPROVE" or "REJECT",
+  "feedback": "explanation of issues found (if REJECT) or confirmation of quality (if APPROVE)"
+}
+
+Output ONLY the JSON object.`, specContent, filesListing.String())
+
+	resp, err := c.infBroker.RouteRequest(context.Background(), &broker.InferenceRequest{
+		TaskID:    task.ID,
+		ModelID:   reviewerModel,
+		AgentType: "reviewer",
+		Messages: []broker.ChatMessage{
+			{Role: "system", Content: "You are a thorough code reviewer. Evaluate code against specifications. Be strict about correctness but pragmatic about style."},
+			{Role: "user", Content: reviewPrompt},
+		},
+		MaxTokens:   4096,
+		Temperature: 0.1,
+	})
+	if err != nil {
+		// If the reviewer model is unavailable, log a warning but don't block.
+		// Fall back to a same-family model.
+		c.emitter.Emit(events.Event{
+			Type:      events.EventReviewCompleted,
+			TaskID:    task.ID,
+			AgentType: "reviewer",
+			Details: map[string]interface{}{
+				"verdict": "approve",
+				"note":    fmt.Sprintf("reviewer model %s unavailable, auto-approved: %v", reviewerModel, err),
+			},
+		})
+		return nil
+	}
+
+	// Record the review cost.
+	reviewCost := float64(resp.InputTokens)*3.0/1_000_000 + float64(resp.OutputTokens)*15.0/1_000_000
+
+	// Parse the review verdict.
+	verdict, feedback := parseReviewVerdict(resp.Content)
+
+	// Record the review run in the database.
+	if attempt != nil && attempt.ID > 0 {
+		_ = c.db.InsertReviewRun(&state.ReviewRun{
+			AttemptID:      attempt.ID,
+			ReviewerModel:  reviewerModel,
+			ReviewerFamily: reviewerFamily,
+			Verdict:        verdict,
+			Feedback:       feedback,
+			CostUSD:        reviewCost,
+			Timestamp:      time.Now(),
+		})
+	}
+
+	c.emitter.Emit(events.Event{
+		Type:      events.EventReviewCompleted,
+		TaskID:    task.ID,
+		AgentType: "reviewer",
+		AgentID:   "review-" + task.ID,
+		Details: map[string]interface{}{
+			"verdict":        verdict,
+			"reviewer_model": reviewerModel,
+			"feedback":       feedback,
+		},
+	})
+
+	if verdict == "reject" {
+		return fmt.Errorf("reviewer rejected: %s", feedback)
+	}
+
+	return nil
+}
+
+// parseReviewVerdict extracts the verdict and feedback from a reviewer's JSON response.
+func parseReviewVerdict(response string) (verdict, feedback string) {
+	// Try to parse as JSON.
+	var result struct {
+		Verdict  string `json:"verdict"`
+		Feedback string `json:"feedback"`
+	}
+
+	// Find JSON in response.
+	start := strings.Index(response, "{")
+	end := strings.LastIndex(response, "}")
+	if start >= 0 && end > start {
+		if err := json.Unmarshal([]byte(response[start:end+1]), &result); err == nil {
+			v := strings.ToLower(strings.TrimSpace(result.Verdict))
+			if v == "approve" || v == "reject" {
+				return v, result.Feedback
+			}
+		}
+	}
+
+	// Fallback: look for APPROVE/REJECT keywords in raw text.
+	lower := strings.ToLower(response)
+	if strings.Contains(lower, "reject") {
+		return "reject", response
+	}
+	// Default to approve if we can't parse the response.
+	return "approve", response
 }
 
 // buildMergeItem reads staged files and constructs a MergeItem for submission

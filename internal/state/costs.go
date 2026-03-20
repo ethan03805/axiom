@@ -15,6 +15,7 @@ func (db *DB) InsertCost(entry *CostEntry) error {
 		attemptID = sql.NullInt64{}
 	}
 
+	db.wmu.Lock()
 	result, err := db.conn.Exec(
 		`INSERT INTO cost_log (task_id, attempt_id, agent_type, model_id, input_tokens, output_tokens, cost_usd, timestamp)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -22,6 +23,7 @@ func (db *DB) InsertCost(entry *CostEntry) error {
 		entry.ModelID, entry.InputTokens, entry.OutputTokens,
 		entry.CostUSD, entry.Timestamp,
 	)
+	db.wmu.Unlock()
 	if err != nil {
 		return fmt.Errorf("insert cost: %w", err)
 	}

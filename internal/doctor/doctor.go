@@ -200,7 +200,29 @@ func (d *Doctor) checkBitNetServer() CheckResult {
 
 func (d *Doctor) checkOpenRouterConnectivity() CheckResult {
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get("https://openrouter.ai/api/v1/models")
+
+	// Include the API key in the request header. Without it, the OpenRouter API
+	// may reject the request or return a non-200 status, causing a false positive
+	// warning even though inference works fine with the key.
+	req, reqErr := http.NewRequest("GET", "https://openrouter.ai/api/v1/models", nil)
+	if reqErr != nil {
+		return CheckResult{
+			Name:    "OpenRouter Connectivity",
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("Cannot create request: %v", reqErr),
+		}
+	}
+
+	// Try API key from config, then from environment.
+	apiKey := d.config.OpenRouterAPIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENROUTER_API_KEY")
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return CheckResult{
 			Name:    "OpenRouter Connectivity",
@@ -210,11 +232,19 @@ func (d *Doctor) checkOpenRouterConnectivity() CheckResult {
 	}
 	resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusUnauthorized {
+	if resp.StatusCode == http.StatusOK {
 		return CheckResult{
 			Name:    "OpenRouter Connectivity",
 			Status:  StatusPass,
 			Message: "OpenRouter API reachable",
+		}
+	}
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return CheckResult{
+			Name:    "OpenRouter Connectivity",
+			Status:  StatusWarning,
+			Message: "OpenRouter API reachable but API key is invalid (HTTP 401)",
 		}
 	}
 
