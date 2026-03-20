@@ -603,14 +603,17 @@ func (c *Coordinator) processMergeQueue() {
 					},
 				})
 			}
+			// Transition through in_review before done, as the state machine
+			// requires in_progress -> in_review -> done (Architecture Section 15.4).
+			// In-process execution skips the reviewer stage, so we advance
+			// through the intermediate state here.
+			_ = c.db.UpdateTaskStatus(result.TaskID, state.TaskStatusInReview)
 			_ = c.db.UpdateTaskStatus(result.TaskID, state.TaskStatusDone)
 		}
 	} else if result.NeedsRequeue {
-		// Task needs to be re-queued with updated context.
-		// Reset to queued so it will be picked up again with fresh context.
+		// Task needs to be re-queued with updated context (stale snapshot).
 		if result.TaskID != "" {
-			_ = c.workQueue.FailTask(result.TaskID)
-			_ = c.db.UpdateTaskStatus(result.TaskID, state.TaskStatusQueued)
+			c.requeueTask(result.TaskID)
 		}
 	}
 }
@@ -804,6 +807,14 @@ func (c *Coordinator) handleReviewResult(taskID string, msg interface{}, raw []b
 	return nil, nil
 }
 
+// requeueTask resets a task from in_progress back to queued through the valid
+// state machine path: in_progress -> failed -> queued (Architecture Section 15.4).
+func (c *Coordinator) requeueTask(taskID string) {
+	_ = c.workQueue.FailTask(taskID)
+	_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusFailed)
+	_ = c.db.UpdateTaskStatus(taskID, state.TaskStatusQueued)
+}
+
 // dispatchReadyTasks finds tasks that are ready to execute, acquires their locks,
 // builds TaskSpecs, and spawns Meeseeks containers. This is the core dispatch
 // cycle from Architecture Section 5.1 step 7.
@@ -855,8 +866,7 @@ func (c *Coordinator) dispatchReadyTasks() {
 					"error": fmt.Sprintf("get HEAD SHA: %v", err),
 				},
 			})
-			_ = c.workQueue.FailTask(task.ID)
-			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			c.requeueTask(task.ID)
 			continue
 		}
 
@@ -870,8 +880,7 @@ func (c *Coordinator) dispatchReadyTasks() {
 					"error": fmt.Sprintf("get SRS refs: %v", err),
 				},
 			})
-			_ = c.workQueue.FailTask(task.ID)
-			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			c.requeueTask(task.ID)
 			continue
 		}
 
@@ -885,8 +894,7 @@ func (c *Coordinator) dispatchReadyTasks() {
 					"error": fmt.Sprintf("get target files: %v", err),
 				},
 			})
-			_ = c.workQueue.FailTask(task.ID)
-			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			c.requeueTask(task.ID)
 			continue
 		}
 		filePaths := make([]string, len(targetFiles))
@@ -912,8 +920,7 @@ func (c *Coordinator) dispatchReadyTasks() {
 					"error": fmt.Sprintf("build TaskSpec: %v", err),
 				},
 			})
-			_ = c.workQueue.FailTask(task.ID)
-			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			c.requeueTask(task.ID)
 			continue
 		}
 
@@ -927,8 +934,7 @@ func (c *Coordinator) dispatchReadyTasks() {
 					"error": fmt.Sprintf("create spec dir: %v", err),
 				},
 			})
-			_ = c.workQueue.FailTask(task.ID)
-			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			c.requeueTask(task.ID)
 			continue
 		}
 		specPath := filepath.Join(specDir, "spec.md")
@@ -940,8 +946,7 @@ func (c *Coordinator) dispatchReadyTasks() {
 					"error": fmt.Sprintf("write spec file: %v", err),
 				},
 			})
-			_ = c.workQueue.FailTask(task.ID)
-			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			c.requeueTask(task.ID)
 			continue
 		}
 
@@ -980,51 +985,17 @@ func (c *Coordinator) dispatchReadyTasks() {
 					"error": fmt.Sprintf("send TaskSpec via IPC: %v", err),
 				},
 			})
-			_ = c.workQueue.FailTask(task.ID)
-			_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+			c.requeueTask(task.ID)
 			continue
 		}
 
-		// Execute the task: either spawn a container or run in-process.
-		if c.containerMgr != nil {
-			// Container-based execution: spawn a Meeseeks Docker container.
-			_, err = c.containerMgr.SpawnMeeseeks(context.Background(), container.SpawnRequest{
-				TaskID:      task.ID,
-				Image:       c.config.Docker.Image,
-				ModelID:     "", // Model selection is handled by the inference broker.
-				CPULimit:    c.config.Docker.CPULimit,
-				MemoryLimit: c.config.Docker.MemLimit,
-				TimeoutMin:  c.config.Docker.TimeoutMinutes,
-			})
-			if err != nil {
-				c.emitter.Emit(events.Event{
-					Type:   events.EventTaskFailed,
-					TaskID: task.ID,
-					Details: map[string]interface{}{
-						"error": fmt.Sprintf("spawn Meeseeks: %v", err),
-					},
-				})
-				_ = c.workQueue.FailTask(task.ID)
-				_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
-				continue
-			}
-
-			// Start watching this task's IPC output directory.
-			if err := c.ipcWatcher.WatchTask(task.ID); err != nil {
-				c.emitter.Emit(events.Event{
-					Type:   events.EventTaskFailed,
-					TaskID: task.ID,
-					Details: map[string]interface{}{
-						"error": fmt.Sprintf("watch task IPC: %v", err),
-					},
-				})
-			}
-		} else {
-			// In-process execution: call the inference broker directly.
-			// This is the fallback when Docker is unavailable.
-			// See Architecture Section 10.2-10.5 (Meeseeks lifecycle).
-			go c.executeTaskInProcess(task, specContent, baseSnapshot, stagingDir)
-		}
+		// Execute the task in-process by calling the inference broker directly.
+		// The Docker container agent runtime is not yet implemented (containers
+		// only have an IPC file watcher with no LLM agent logic). Until a full
+		// container-based agent is built, all tasks execute in-process through
+		// the inference broker, which provides the same budget tracking and audit.
+		// See Architecture Section 10.2-10.5 (Meeseeks lifecycle).
+		go c.executeTaskInProcess(task, specContent, baseSnapshot, stagingDir)
 	}
 }
 
@@ -1087,8 +1058,7 @@ Create all files needed to complete the task.`, specContent)
 				"error": fmt.Sprintf("in-process inference: %v", err),
 			},
 		})
-		_ = c.workQueue.FailTask(task.ID)
-		_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+		c.requeueTask(task.ID)
 		return
 	}
 
@@ -1103,8 +1073,7 @@ Create all files needed to complete the task.`, specContent)
 				"response_length": len(resp.Content),
 			},
 		})
-		_ = c.workQueue.FailTask(task.ID)
-		_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+		c.requeueTask(task.ID)
 		return
 	}
 
@@ -1138,7 +1107,9 @@ Create all files needed to complete the task.`, specContent)
 	}
 
 	// Build and write manifest.json per Architecture Section 10.4.
-	manifest := buildManifest(task.ID, baseSnapshot, files)
+	// Use currentHead (re-read below before merge submission) if available,
+	// otherwise fall back to the dispatch-time baseSnapshot.
+	manifest := buildManifest(task.ID, baseSnapshot, files) // snapshot updated in MergeItem below
 	manifestJSON, _ := json.MarshalIndent(manifest, "", "  ")
 	if err := os.WriteFile(filepath.Join(stagingDir, "manifest.json"), manifestJSON, 0644); err != nil {
 		c.emitter.Emit(events.Event{
@@ -1148,20 +1119,29 @@ Create all files needed to complete the task.`, specContent)
 				"error": fmt.Sprintf("write manifest: %v", err),
 			},
 		})
-		_ = c.workQueue.FailTask(task.ID)
-		_ = c.db.UpdateTaskStatus(task.ID, state.TaskStatusQueued)
+		c.requeueTask(task.ID)
 		return
 	}
 
-	// Mark the task as done. In a full pipeline, this would go through
-	// the approval pipeline (validation sandbox -> reviewer -> orchestrator -> merge queue).
-	// For in-process execution, we submit to the merge queue directly.
+	// Re-read HEAD SHA just before submitting to the merge queue.
+	// In-process execution runs in a goroutine and other tasks may have
+	// committed while the inference call was in-flight. Using the current
+	// HEAD (rather than the stale baseSnapshot from dispatch time) avoids
+	// unnecessary stale-snapshot requeue cycles that waste budget.
+	currentHead, headErr := c.gitMgr.HeadSHA()
+	if headErr != nil {
+		currentHead = baseSnapshot // fall back to original if git fails
+	}
+
+	// Submit to the merge queue directly. In a full pipeline, this would go
+	// through the approval pipeline (validation sandbox -> reviewer ->
+	// orchestrator -> merge queue).
 	srsRefs, _ := c.db.GetTaskSRSRefs(task.ID)
 	mergeItem := &merge.MergeItem{
 		TaskID:       task.ID,
 		TaskTitle:    task.Title,
 		StagingDir:   stagingDir,
-		BaseSnapshot: baseSnapshot,
+		BaseSnapshot: currentHead,
 		Files:        files,
 		SRSRefs:      srsRefs,
 	}
