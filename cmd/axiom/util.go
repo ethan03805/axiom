@@ -2,7 +2,12 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
 
 	"github.com/ethan03805/axiom/internal/doctor"
 	"github.com/ethan03805/axiom/internal/engine"
@@ -89,6 +94,27 @@ See Architecture Section 19.5 (Credential Management).`,
 		cfg, err := engine.LoadConfig()
 		if err != nil {
 			return fmt.Errorf("reload config: %w", err)
+		}
+
+		// Try to signal the running engine process via PID file.
+		pidPath := filepath.Join(".axiom", "engine.pid")
+		pidData, err := os.ReadFile(pidPath)
+		if err == nil {
+			pidStr := strings.TrimSpace(string(pidData))
+			if pid, parseErr := strconv.Atoi(pidStr); parseErr == nil {
+				proc, findErr := os.FindProcess(pid)
+				if findErr == nil {
+					if sigErr := proc.Signal(syscall.SIGHUP); sigErr == nil {
+						fmt.Printf("Sent reload signal to running engine (PID %d).\n", pid)
+					} else {
+						fmt.Printf("Could not signal engine process %d: %v\n", pid, sigErr)
+						fmt.Println("If no engine is running, the new config will take effect on next 'axiom run'.")
+					}
+				}
+			}
+		} else {
+			fmt.Println("No running engine detected (no PID file).")
+			fmt.Println("New configuration will take effect on next 'axiom run'.")
 		}
 
 		fmt.Println("Configuration reloaded successfully.")

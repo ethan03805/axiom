@@ -52,11 +52,21 @@ var apiStartCmd = &cobra.Command{
 			rateLimit = 120
 		}
 
-		srv := api.NewServer(api.ServerConfig{
-			Port:         port,
-			RateLimitRPM: rateLimit,
-			AllowedIPs:   cfg.API.AllowedIPs,
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("get home dir: %w", err)
+		}
+		tokenStorageDir := filepath.Join(home, ".axiom", "api-tokens")
+
+		srv, err := api.NewServer(api.ServerConfig{
+			Port:            port,
+			RateLimitRPM:    rateLimit,
+			AllowedIPs:      cfg.API.AllowedIPs,
+			TokenStorageDir: tokenStorageDir,
 		}, coord.Emitter())
+		if err != nil {
+			return fmt.Errorf("create api server: %w", err)
+		}
 
 		if err := srv.Start(); err != nil {
 			return fmt.Errorf("start api server: %w", err)

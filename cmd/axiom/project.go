@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/ethan03805/axiom/internal/engine"
 	"github.com/ethan03805/axiom/internal/state"
@@ -217,11 +219,37 @@ See Architecture Section 5.1 for the project lifecycle.`,
 		fmt.Printf("Runtime: %s\n", cfg.Orchestrator.Runtime)
 		fmt.Printf("Max concurrent Meeseeks: %d\n", cfg.Concurrency.MaxMeeseeks)
 
-		// The execution loop runs in the background via the coordinator.
-		// For now, wait for interrupt signal.
-		// In production, this would block until completion or cancellation.
+		// Write PID file so `axiom config reload` can signal us.
+		if err := coord.WritePIDFile(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not write PID file: %v\n", err)
+		}
+		defer coord.RemovePIDFile()
+
+		// Start the orchestrator with the user's prompt.
+		if err := coord.StartOrchestrator(cmd.Context(), prompt); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: orchestrator start: %v\n", err)
+		}
+
+		// Handle SIGHUP for config reload, SIGINT/SIGTERM for shutdown.
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+
 		fmt.Println("\nPress Ctrl+C to stop.")
-		select {}
+		for {
+			sig := <-sigCh
+			if sig == syscall.SIGHUP {
+				fmt.Println("Reloading configuration...")
+				if err := coord.ReloadConfig(); err != nil {
+					fmt.Fprintf(os.Stderr, "config reload error: %v\n", err)
+				} else {
+					fmt.Println("Configuration reloaded successfully.")
+				}
+				continue
+			}
+			// SIGINT or SIGTERM: shutdown.
+			break
+		}
+		return nil
 	},
 }
 

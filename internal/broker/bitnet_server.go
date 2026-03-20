@@ -163,7 +163,7 @@ func (s *BitNetServer) startViaPythonWrapper(bitnetDir, modelPath string) error 
 	s.startedAt = time.Now()
 
 	if err := s.waitForReady(30 * time.Second); err != nil {
-		s.Stop()
+		s.stopInternal()
 		return fmt.Errorf("BitNet server (Python wrapper) failed to become ready: %w", err)
 	}
 
@@ -201,7 +201,7 @@ func (s *BitNetServer) startDirectBinary(bitnetDir, modelPath string) error {
 	s.startedAt = time.Now()
 
 	if err := s.waitForReady(30 * time.Second); err != nil {
-		s.Stop()
+		s.stopInternal()
 		return fmt.Errorf("BitNet server failed to become ready: %w", err)
 	}
 
@@ -212,7 +212,12 @@ func (s *BitNetServer) startDirectBinary(bitnetDir, modelPath string) error {
 func (s *BitNetServer) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.stopInternal()
+}
 
+// stopInternal shuts down the BitNet server without acquiring the mutex.
+// Used by Start() when cleanup is needed while the lock is already held.
+func (s *BitNetServer) stopInternal() error {
 	if !s.running {
 		return nil
 	}
@@ -338,23 +343,25 @@ func (s *BitNetServer) SetupModelsDir() (string, error) {
 	return s.config.ModelsDir, nil
 }
 
-// EnsureWeights checks if model weight files exist in the models directory.
+// EnsureWeights checks if model weight files exist in the models directory
+// or in the vendored BitNet models directory.
 // Returns (true, nil) if weights are present, (false, nil) if absent,
 // or (false, error) on filesystem errors.
 // See Architecture Section 19.9.
 func (s *BitNetServer) EnsureWeights() (bool, error) {
+	// Check user models dir.
 	entries, err := os.ReadDir(s.config.ModelsDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
+	if err == nil {
+		for _, e := range entries {
+			ext := filepath.Ext(e.Name())
+			if !e.IsDir() && (ext == ".gguf" || ext == ".bin") {
+				return true, nil
+			}
 		}
-		return false, fmt.Errorf("read models dir: %w", err)
 	}
-	for _, e := range entries {
-		ext := filepath.Ext(e.Name())
-		if !e.IsDir() && (ext == ".gguf" || ext == ".bin") {
-			return true, nil
-		}
+	// Check vendored model path.
+	if p := s.ResolveModelPath(); p != "" {
+		return true, nil
 	}
 	return false, nil
 }

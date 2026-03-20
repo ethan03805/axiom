@@ -21,10 +21,8 @@ RUN npm install -g typescript eslint && \
     npm cache clean --force
 
 # Create non-root user (UID 1000) per Architecture Section 12.6.1.
-# Node Alpine images may already have a user at UID 1000 (node), so handle
-# the case where the group or user already exists.
-RUN addgroup -g 1000 axiom 2>/dev/null || true && \
-    adduser -u 1000 -G axiom -D -h /home/axiom axiom 2>/dev/null || true
+# Node Alpine images already have a 'node' user at UID 1000.
+# We use that user directly to avoid conflicts.
 
 # Create workspace directories per Architecture Section 12.3.
 #   /workspace/spec        -- read-only TaskSpec/ReviewSpec input
@@ -36,7 +34,7 @@ RUN mkdir -p \
         /workspace/staging \
         /workspace/ipc/input \
         /workspace/ipc/output && \
-    chown -R axiom:axiom /workspace
+    chown -R node:node /workspace
 
 # Copy and install the IPC watcher entrypoint script.
 COPY docker/axiom-entrypoint.sh /usr/local/bin/axiom-entrypoint.sh

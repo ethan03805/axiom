@@ -19,9 +19,10 @@ import (
 
 // ServerConfig holds API server configuration.
 type ServerConfig struct {
-	Port         int
-	RateLimitRPM int
-	AllowedIPs   []string
+	Port            int
+	RateLimitRPM    int
+	AllowedIPs      []string
+	TokenStorageDir string // Path to persistent token storage (e.g. ~/.axiom/api-tokens/)
 }
 
 // Server provides the REST + WebSocket API for Axiom.
@@ -36,9 +37,20 @@ type Server struct {
 	handlers *Handlers
 }
 
-// NewServer creates an API server.
-func NewServer(config ServerConfig, emitter *events.Emitter) *Server {
-	auth := NewTokenAuth()
+// NewServer creates an API server. If TokenStorageDir is set, persisted tokens
+// are loaded from disk so that tokens generated via `axiom api token generate`
+// are recognized by the running server. See Architecture Section 24.3.
+func NewServer(config ServerConfig, emitter *events.Emitter) (*Server, error) {
+	var auth *TokenAuth
+	if config.TokenStorageDir != "" {
+		var err error
+		auth, err = NewTokenAuthWithStorage(config.TokenStorageDir)
+		if err != nil {
+			return nil, fmt.Errorf("init token auth with storage: %w", err)
+		}
+	} else {
+		auth = NewTokenAuth()
+	}
 	limiter := NewRateLimiter(config.RateLimitRPM)
 	wsHub := NewWSHub(emitter)
 
@@ -50,7 +62,7 @@ func NewServer(config ServerConfig, emitter *events.Emitter) *Server {
 		wsHub:   wsHub,
 	}
 	s.handlers = &Handlers{emitter: emitter}
-	return s
+	return s, nil
 }
 
 // Start begins listening for HTTP requests.

@@ -14,7 +14,10 @@ import (
 func setupTestServer(t *testing.T) *Server {
 	t.Helper()
 	emitter := events.NewEmitter()
-	srv := NewServer(ServerConfig{Port: 0, RateLimitRPM: 120}, emitter)
+	srv, err := NewServer(ServerConfig{Port: 0, RateLimitRPM: 120}, emitter)
+	if err != nil {
+		t.Fatalf("create test server: %v", err)
+	}
 	return srv
 }
 

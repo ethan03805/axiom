@@ -38,7 +38,7 @@ RUN apk add --no-cache \
 COPY --from=go-builder /usr/local/go /usr/local/go
 COPY --from=go-builder /go/bin/golangci-lint /usr/local/bin/golangci-lint
 ENV PATH="/usr/local/go/bin:${PATH}"
-ENV GOPATH="/home/axiom/go"
+ENV GOPATH="/home/node/go"
 
 # Install Node.js global tools.
 RUN npm install -g typescript eslint && \
@@ -50,10 +50,8 @@ RUN npm install -g typescript eslint && \
 RUN pip3 install --no-cache-dir --break-system-packages ruff mypy pytest
 
 # Create non-root user (UID 1000) per Architecture Section 12.6.1.
-# Node Alpine images may already have a user at UID 1000 (node), so handle
-# the case where the group or user already exists.
-RUN addgroup -g 1000 axiom 2>/dev/null || true && \
-    adduser -u 1000 -G axiom -D -h /home/axiom axiom 2>/dev/null || true
+# Node Alpine images already have a 'node' user at UID 1000.
+# We use that user directly to avoid conflicts.
 
 # Create workspace directories per Architecture Section 12.3.
 #   /workspace/spec        -- read-only TaskSpec/ReviewSpec input
@@ -66,8 +64,8 @@ RUN mkdir -p \
         /workspace/staging \
         /workspace/ipc/input \
         /workspace/ipc/output \
-        /home/axiom/go && \
-    chown -R axiom:axiom /workspace /home/axiom/go
+        /home/node/go && \
+    chown -R node:node /workspace /home/node/go
 
 # Copy and install the IPC watcher entrypoint script.
 COPY docker/axiom-entrypoint.sh /usr/local/bin/axiom-entrypoint.sh

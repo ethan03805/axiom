@@ -1123,6 +1123,157 @@ func (c *Coordinator) activeContainerCount() int {
 	return c.containerMgr.ActiveCount()
 }
 
+// StartOrchestrator initializes and starts the orchestrator based on the
+// configured runtime and available infrastructure.
+//
+// When Docker is available and the runtime is an embedded type (claude-code,
+// codex, opencode), it starts an Embedded orchestrator in a container.
+//
+// When Docker is unavailable or the runtime is "claw" with no external Claw
+// connected, it falls back to a Direct orchestrator that calls the inference
+// broker (OpenRouter) in-process.
+//
+// See Architecture Section 8 (Orchestrator).
+func (c *Coordinator) StartOrchestrator(ctx context.Context, prompt string) error {
+	// Determine if this is a greenfield project (no source files).
+	isGreenfield := c.isGreenfield()
+
+	// Generate a project ID from config or directory name.
+	projectID := c.config.Project.Slug
+	if projectID == "" {
+		projectID = filepath.Base(c.projectRoot)
+	}
+	c.projectID = projectID
+
+	runtime := c.config.Orchestrator.Runtime
+
+	// Try embedded orchestrator if Docker is available and runtime supports it.
+	if c.containerMgr != nil && runtime != "claw" {
+		c.orchestratorMgr = orchestrator.NewEmbedded(
+			orchestrator.EmbeddedConfig{
+				Runtime:     orchestrator.Runtime(runtime),
+				Image:       c.config.Docker.Image,
+				CPULimit:    c.config.Docker.CPULimit,
+				MemoryLimit: c.config.Docker.MemLimit,
+				TimeoutMin:  c.config.Docker.TimeoutMinutes,
+				ProjectSlug: projectID,
+				BudgetUSD:   c.config.Budget.MaxUSD,
+			},
+			c.containerMgr,
+			c.db,
+			c.emitter,
+			c.ipcWriter,
+		)
+		if err := c.orchestratorMgr.Start(ctx, projectID, prompt, isGreenfield); err != nil {
+			// Embedded orchestrator failed (e.g., Docker image missing).
+			// Fall through to direct orchestrator.
+			c.emitter.Emit(events.Event{
+				Type:      events.EventProviderUnavailable,
+				AgentType: "engine",
+				Details: map[string]interface{}{
+					"provider": "embedded_orchestrator",
+					"error":    err.Error(),
+					"fallback": "direct_orchestrator",
+				},
+			})
+			c.orchestratorMgr = nil
+		} else {
+			return nil
+		}
+	}
+
+	// Fallback: Direct orchestrator using OpenRouter via the inference broker.
+	// This runs in-process without Docker containers.
+	directOrch := orchestrator.NewDirect(
+		orchestrator.DirectConfig{
+			Runtime:     orchestrator.Runtime(runtime),
+			BudgetUSD:   c.config.Budget.MaxUSD,
+			ProjectSlug: projectID,
+		},
+		c.infBroker,
+		c.db,
+		c.emitter,
+	)
+
+	if err := directOrch.Start(ctx, projectID, prompt, isGreenfield); err != nil {
+		return fmt.Errorf("start direct orchestrator: %w", err)
+	}
+
+	c.emitter.Emit(events.Event{
+		Type:      events.EventContainerSpawned,
+		AgentType: "engine",
+		Details: map[string]interface{}{
+			"orchestrator_mode": "direct",
+			"runtime":           runtime,
+		},
+	})
+
+	return nil
+}
+
+// isGreenfield returns true if the project has no existing source files
+// (ignoring .axiom/, .git/, and other metadata directories).
+func (c *Coordinator) isGreenfield() bool {
+	entries, err := os.ReadDir(c.projectRoot)
+	if err != nil {
+		return true
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if name == ".axiom" || name == ".git" || name == ".gitignore" || name == ".claude" {
+			continue
+		}
+		// Any other file/directory means existing project.
+		return false
+	}
+	return true
+}
+
+// ReloadConfig re-reads configuration from disk and updates live subsystems.
+// Currently updates the inference broker's OpenRouter API key.
+// See Architecture Section 19.5 (Credential Management).
+func (c *Coordinator) ReloadConfig() error {
+	cfg, err := LoadConfig()
+	if err != nil {
+		return fmt.Errorf("reload config: %w", err)
+	}
+
+	// Update OpenRouter API key in the broker.
+	apiKey := cfg.OpenRouter.APIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENROUTER_API_KEY")
+	}
+	c.infBroker.UpdateOpenRouterKey(apiKey)
+
+	// Update the stored config reference.
+	c.mu.Lock()
+	c.config = cfg
+	c.mu.Unlock()
+
+	c.emitter.Emit(events.Event{
+		Type:      events.EventTaskCreated, // Using generic event for config reload
+		AgentType: "engine",
+		Details: map[string]interface{}{
+			"action": "config_reloaded",
+		},
+	})
+
+	return nil
+}
+
+// WritePIDFile writes the current process PID to .axiom/engine.pid.
+// Used by `axiom config reload` to find the running engine process.
+func (c *Coordinator) WritePIDFile() error {
+	pidPath := filepath.Join(c.projectRoot, ".axiom", "engine.pid")
+	return os.WriteFile(pidPath, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
+}
+
+// RemovePIDFile removes the PID file on shutdown.
+func (c *Coordinator) RemovePIDFile() {
+	pidPath := filepath.Join(c.projectRoot, ".axiom", "engine.pid")
+	os.Remove(pidPath)
+}
+
 // completionPercentage calculates the percentage of tasks that are done.
 func (c *Coordinator) completionPercentage() float64 {
 	tasks, err := c.db.ListTasks(state.TaskFilter{})

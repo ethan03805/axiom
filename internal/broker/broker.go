@@ -424,3 +424,32 @@ func (b *Broker) GetTaskRequestCount(taskID string) int {
 	defer b.mu.Unlock()
 	return b.taskReqCount[taskID]
 }
+
+// RouteRequest provides direct access to the inference broker for in-process
+// callers (e.g., the DirectOrchestrator). Unlike HandleInferenceRequest, this
+// accepts an InferenceRequest directly rather than an IPC message.
+// Cost is logged and rate-limited the same way as IPC-based requests.
+func (b *Broker) RouteRequest(ctx context.Context, req *InferenceRequest) (*InferenceResponse, error) {
+	start := time.Now()
+	resp, err := b.route(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Latency = time.Since(start)
+
+	b.logCost(req, resp)
+
+	b.mu.Lock()
+	b.taskReqCount[req.TaskID]++
+	b.mu.Unlock()
+
+	return resp, nil
+}
+
+// UpdateOpenRouterKey updates the OpenRouter API key at runtime.
+// This supports config reload without engine restart per Architecture Section 19.5.
+func (b *Broker) UpdateOpenRouterKey(key string) {
+	if orClient, ok := b.openrouter.(*OpenRouterClient); ok {
+		orClient.UpdateAPIKey(key)
+	}
+}
